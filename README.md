@@ -34,10 +34,12 @@ this fork's changes on top.
   (`ds_bpermute_b32` cross-half scratch).
 - **Pipeline workers** — `VICTORY_PIPELINE_WORKERS` (default: half the logical CPUs, 2–8) and
   `VICTORY_PIPELINE_PRIORITY`.
-- **`VICTORY_FRAMETIME_DUMP=<path>`** — a CSV, one row per ~1 s summary interval, with the frame
-  time and the buckets the runtime already measures (`gpu_ms`, `cpu_prepare_ms`, `copies_ms`,
-  `textures_ms`, `copyback_ms`, `heap_ms`, `card_*`, …), plus the worst/average **single** frame.
-  Release-buildable. Implementation: `crates/victory-gpu/src/frametime.rs`.
+- **`VICTORY_FRAMETIME_DUMP`** — `=1` writes `<cache>\frametime.csv` (default
+  `%LOCALAPPDATA%\victory\cache\frametime.csv`); any other value is a path. One CSV row per ~1 s
+  summary interval, with the frame time and the buckets the runtime already measures (`gpu_ms`,
+  `cpu_prepare_ms`, `copies_ms`, `textures_ms`, `copyback_ms`, `heap_ms`, `card_*`, …), plus the
+  worst/average **single** frame. Release-buildable. Implementation:
+  `crates/victory-gpu/src/frametime.rs`.
 
 ## Performance on this machine
 
@@ -85,8 +87,12 @@ set VICTORY_CARD_BUFFERS_MIN_MB=1
 set VICTORY_CARD_BUFFERS_MB=1024
 set VICTORY_CARD_REHASH_RUNS=1
 set VICTORY_JOIN_COPIES=1
-set VICTORY_FRAMETIME_DUMP=%TEMP%\victory-frametime.csv
+set VICTORY_FRAMETIME_DUMP=1
 ```
+
+`VICTORY_FRAMETIME_DUMP=1` is created on the first presented frame (~1 s in) and truncated at the
+start of each run, so each run gets a fresh file. In PowerShell use
+`$env:VICTORY_FRAMETIME_DUMP = '1'` — `%TEMP%`/`%LOCALAPPDATA%` are not expanded there.
 
 ## Known issues
 

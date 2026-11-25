@@ -19,6 +19,10 @@ pub fn run(
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
     let cfg = victory_core::Config::load()?;
+    // `VICTORY_FRAMETIME_DUMP=1`: write beside the rest of Victory's cache.
+    if std::env::var_os("VICTORY_FRAMETIME_DUMP").is_some_and(|v| v.to_str() == Some("1")) {
+        victory_gpu::frametime::use_dump_path(cfg.cache_dir.join("frametime.csv"));
+    }
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
