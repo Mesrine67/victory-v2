@@ -163,9 +163,16 @@ fn metadata() -> &'static str {
                 out.push_str(&format!("# display: {w}x{h}\n"));
             }
         }
+        // (Neptune) A dump is made to be posted: of a switch that names a file or a folder
+        // (`VICTORY_FSR_DLL`, the dump's own path) only the last part is written, not where
+        // it lies on this PC.
+        let shown = |value: String| match value.rfind(['/', std::path::MAIN_SEPARATOR]) {
+            Some(at) => format!("...{}", &value[at..]),
+            None => value,
+        };
         let mut switches: Vec<String> = std::env::vars()
             .filter(|(key, value)| key.starts_with("VICTORY_") && !value.is_empty())
-            .map(|(key, value)| format!("{key}={value}"))
+            .map(|(key, value)| format!("{key}={}", shown(value)))
             .collect();
         switches.sort();
         if !switches.is_empty() {

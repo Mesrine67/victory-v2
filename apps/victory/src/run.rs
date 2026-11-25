@@ -18,19 +18,20 @@ pub fn run(
 
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
-    if execute {
-        // Before the host's own memory (the image read below, the GPU
-        // device, the caches) takes the space the title's 32-bit memory needs.
-        victory_hle::modules::xmem::low_guards::install();
-    }
     let cfg = victory_core::Config::load()?;
+    // `VICTORY_FRAMETIME_DUMP=1`: write beside the rest of Victory's cache.
+    if std::env::var_os("VICTORY_FRAMETIME_DUMP").is_some_and(|v| v.to_str() == Some("1")) {
+        victory_gpu::frametime::use_dump_path(cfg.cache_dir.join("frametime.csv"));
+    }
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
-    match victory_game::identify(&hash) {
-        Some(build) => println!("build          {} ({hash})", build.label),
-        None => println!("build          unknown ({hash})"),
-    }
+    let label = match victory_game::identify(&hash) {
+        Some(build) => format!("{} ({hash})", build.label),
+        None => format!("unknown ({hash})"),
+    };
+    println!("build          {label}");
+    victory_gpu::frametime::use_build_label(label);
 
     let images = cfg.cache_subdir("images")?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
@@ -43,6 +44,7 @@ pub fn run(
     drop(original);
     victory_hle::runtime::set_main_image(image.base());
     victory_hle::runtime::set_image_path(image.base(), exe);
+    victory_hle::runtime::set_image_size(image.base(), image.info().size_of_image as usize);
     println!(
         "mapped at      {:#x} (preferred {:#x})",
         image.base(),
@@ -80,6 +82,7 @@ pub fn run(
     for (name, dll) in &dlls {
         println!("title dll      {name} at {:#x}", dll.base());
         victory_hle::runtime::set_image_path(dll.base(), &title_dir.join(name));
+        victory_hle::runtime::set_image_size(dll.base(), dll.info().size_of_image as usize);
     }
 
     let policy = match unimplemented {
@@ -111,7 +114,6 @@ pub fn run(
         println!("not executing (pass --execute to start the title)");
         return Ok(());
     }
-    crate::rt_off::apply(title_dir);
     victory_loader::report_crashes();
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
     victory_hle::runtime::use_console_timers();
@@ -253,6 +255,7 @@ impl LateDlls {
                     );
                     show(name, dll.bind_imports(&resolver, self.policy)?);
                     set_image_path(dll.base(), &self.title_dir.join(name));
+                    victory_hle::runtime::set_image_size(dll.base(), dll.info().size_of_image as usize);
                 }
                 // Visible before their `DllMain`s run, which may load more.
                 mapped.extend(new.iter().cloned());

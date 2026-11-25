@@ -19,7 +19,6 @@ use std::time::{Duration, Instant};
 
 use super::xasync::{E_INVALIDARG, E_NOTIMPL};
 use super::xgameruntime::{HRESULT, S_OK};
-use super::mouse::MouseInput;
 use crate::{HleExport, HleModule};
 
 /// The documented errors.
@@ -59,12 +58,18 @@ const KEYBOARD: usize = PADS + 1;
 const DEVICES: usize = PADS + 2;
 
 /// Readings kept per device for next/previous lookups.
-const HISTORY: usize = 32;
+const HISTORY: usize = 256;
 const POLL: Duration = Duration::from_millis(8);
 
 /// The keyboard's stand-in gamepad (virtual key, button); README lists it.
 /// Sticks: W/A/S/D left, I/J/K/L right; triggers Z and C.
-const FALLBACK_BUTTONS: [(u8, u32); 14] = [
+const FALLBACK_BUTTONS: [(u8, u32); 18] = [
+    // (Neptune) Shift pushes the left stick in, Ctrl the right one (either
+    // side's key; devices report the sided keys only).
+    (0xA0, LEFT_STICK),
+    (0xA1, LEFT_STICK),
+    (0xA2, RIGHT_STICK),
+    (0xA3, RIGHT_STICK),
     (0x1B, MENU), // Esc
     (0x09, VIEW), // Tab
     (0x0D, A),    // Enter
@@ -114,33 +119,32 @@ trait Source: Send {
     fn keys(&mut self) -> Vec<KeyState>;
     /// Motor speeds: low frequency (left), high frequency (right).
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
-    /// What the captured mouse adds to the pad the title reads.
-    fn mouse(&mut self) -> MouseInput {
-        MouseInput::default()
+}
+
+/// The mouse as the stand-in pad reads it (Neptune): the right button is
+/// the left trigger, the left button the right trigger, and movement the
+/// right stick (-1 to 1, up positive).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Mouse {
+    left: bool,
+    right: bool,
+    x: f32,
+    y: f32,
+}
+
+/// The host's mouse; nothing where there is none.
+fn mouse() -> Mouse {
+    #[cfg(windows)]
+    {
+        host::mouse()
+    }
+    #[cfg(not(windows))]
+    {
+        Mouse::default()
     }
 }
 
-/// The mouse on top of a pad: right stick added (capped), buttons pull the
-/// triggers (left button the right trigger) and click the right stick.
-fn with_mouse(mut pad: PadState, m: &MouseInput) -> PadState {
-    if *m == MouseInput::default() {
-        return pad;
-    }
-    pad.right_x = (pad.right_x + m.right_x).clamp(-1.0, 1.0);
-    pad.right_y = (pad.right_y + m.right_y).clamp(-1.0, 1.0);
-    if m.left {
-        pad.right_trigger = 1.0;
-    }
-    if m.right {
-        pad.left_trigger = 1.0;
-    }
-    if m.middle {
-        pad.buttons |= RIGHT_STICK;
-    }
-    pad
-}
-
-fn fallback(keys: &[KeyState]) -> PadState {
+fn fallback(keys: &[KeyState], mouse: Mouse) -> PadState {
     let on = |vk: u8| {
         if keys.iter().any(|k| k.virtual_key == vk) {
             1.0
@@ -153,12 +157,12 @@ fn fallback(keys: &[KeyState]) -> PadState {
             .iter()
             .filter(|(vk, _)| on(*vk) != 0.0)
             .fold(0, |all, (_, bit)| all | bit),
-        left_trigger: on(b'Z'),
-        right_trigger: on(b'C'),
+        left_trigger: f32::max(on(b'Z'), f32::from(u8::from(mouse.right))),
+        right_trigger: f32::max(on(b'C'), f32::from(u8::from(mouse.left))),
         left_x: on(b'D') - on(b'A'),
         left_y: on(b'W') - on(b'S'),
-        right_x: on(b'L') - on(b'J'),
-        right_y: on(b'I') - on(b'K'),
+        right_x: (on(b'L') - on(b'J') + mouse.x).clamp(-1.0, 1.0),
+        right_y: (on(b'I') - on(b'K') + mouse.y).clamp(-1.0, 1.0),
     }
 }
 
@@ -426,12 +430,12 @@ impl Hub {
 
     /// Reads the host once; device callbacks run on the calling thread.
     fn poll(&self) {
-        let (pads, keys, mouse) = {
+        let (pads, keys) = {
             let mut source = lock(&self.source);
             let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
-            (pads, source.keys(), source.mouse())
+            (pads, source.keys())
         };
-        let events = self.state().poll(&self.devices, pads, keys, mouse);
+        let events = self.state().poll(&self.devices, pads, keys);
         self.deliver(events);
     }
 
@@ -474,21 +478,16 @@ impl State {
     fn poll(
         &mut self,
         devices: &[Device; DEVICES],
-        mut pads: [Option<PadState>; PADS],
+        pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
-        mouse: MouseInput,
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
         let any_pad = pads.iter().any(Option::is_some);
-        // The mouse goes to the first host pad, else to the stand-in.
-        if let Some(pad) = pads.iter_mut().flatten().next() {
-            *pad = with_mouse(*pad, &mouse);
-        }
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
-        let fallback = (!any_pad).then(|| Value::Pad(with_mouse(fallback(&keys), &mouse)));
+        let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys, mouse())));
         self.update(devices, FALLBACK, fallback, now, &mut events);
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
         events
@@ -1206,6 +1205,17 @@ mod host {
                     .collect();
                 down.extend(held);
             }
+            // (Neptune) `VICTORY_AUTO_A=<seconds>`: for that long after the start, Enter
+            // (the stand-in pad's A) is down for a quarter of a second in every four,
+            // whether or not the window has focus: a launch gets through the title's
+            // "press A" screens without the focus being taken from what the user does.
+            static AUTO_A: LazyLock<u64> = LazyLock::new(|| {
+                std::env::var("VICTORY_AUTO_A").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0)
+            });
+            let run = super::START.elapsed();
+            if run.as_secs() < *AUTO_A && run.as_millis() % 4000 < 250 && !down.contains(&0x0D) {
+                down.push(0x0D);
+            }
             down.into_iter()
                 .map(|vk| KeyState {
                     // SAFETY: plain query.
@@ -1216,10 +1226,6 @@ mod host {
                     ..Default::default()
                 })
                 .collect()
-        }
-
-        fn mouse(&mut self) -> MouseInput {
-            crate::modules::mouse::take()
         }
 
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
@@ -1269,6 +1275,129 @@ mod host {
             .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
             .map(|&(_, vk)| vk)
             .collect()
+    }
+
+    /// The mouse for the stand-in pad. The pointer is the user's own, and
+    /// gives the pad nothing, until a click on the picture (or F9) takes
+    /// it: from then the buttons are the triggers and its movement since
+    /// the last reading is a stick (smoothed over a few readings;
+    /// `VICTORY_MOUSE` scales it, default 1), and it is hidden and put back
+    /// at the picture's middle after each reading. F9 lets it go, and so
+    /// does the window losing focus; it is not taken again before the next
+    /// click on the picture.
+    pub(super) fn mouse() -> Mouse {
+        use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering::Relaxed};
+        use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            CallWindowProcW, GWLP_WNDPROC, GetCursorPos, GetWindowInfo, GetWindowLongPtrW, SetCursor,
+            SetCursorPos, SetWindowLongPtrW, WINDOWINFO, WNDPROC,
+        };
+        /// The pointer is taken: the window shows no cursor over its picture.
+        static TAKEN: AtomicBool = AtomicBool::new(false);
+        /// The window whose procedure `hidden` stands before, and that procedure.
+        static BEFORE: [AtomicIsize; 2] = [AtomicIsize::new(0), AtomicIsize::new(0)];
+        /// Stands before the window's own procedure: no cursor over the
+        /// picture while the pointer is taken.
+        unsafe extern "system" fn hidden(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+            const WM_SETCURSOR: u32 = 0x20;
+            const HTCLIENT: isize = 1;
+            // SAFETY: no cursor is a valid cursor; `BEFORE[1]` is the procedure the
+            // window had, stored before ours was set.
+            unsafe {
+                if message == WM_SETCURSOR && TAKEN.load(Relaxed) && (l & 0xffff) == HTCLIENT {
+                    SetCursor(std::ptr::null_mut());
+                    return 1;
+                }
+                let own: WNDPROC = std::mem::transmute::<isize, WNDPROC>(BEFORE[1].load(Relaxed));
+                CallWindowProcW(own, hwnd, message, w, l)
+            }
+        }
+        struct Held {
+            taken: bool,
+            f9: bool,
+            fresh: bool,
+            /// The left button at the last reading.
+            left: bool,
+            /// The click that took the pointer is still held: no trigger pull.
+            click: bool,
+            x: f32,
+            y: f32,
+        }
+        static HELD: std::sync::Mutex<Held> = std::sync::Mutex::new(Held {
+            taken: false,
+            f9: false,
+            fresh: true,
+            left: false,
+            click: false,
+            x: 0.0,
+            y: 0.0,
+        });
+        static SCALE: std::sync::LazyLock<f32> = std::sync::LazyLock::new(|| {
+            std::env::var("VICTORY_MOUSE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1.0)
+        });
+        let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
+        if !focused() {
+            (held.taken, held.fresh, held.x, held.y) = (false, true, 0.0, 0.0);
+            (held.left, held.click) = (false, false);
+            TAKEN.store(false, Relaxed);
+            return Mouse::default();
+        }
+        // SAFETY: plain queries, a pointer move inside our own window, and our
+        // procedure set before that window's own, which it calls.
+        unsafe {
+            let f9 = GetAsyncKeyState(0x78) < 0;
+            if f9 && !held.f9 {
+                (held.taken, held.fresh, held.x, held.y) = (!held.taken, true, 0.0, 0.0);
+            }
+            held.f9 = f9;
+            let hwnd = GetForegroundWindow();
+            let mut info: WINDOWINFO = std::mem::zeroed();
+            info.cbSize = size_of::<WINDOWINFO>() as u32;
+            let mut at = POINT { x: 0, y: 0 };
+            if GetWindowInfo(hwnd, &mut info) == 0 || GetCursorPos(&mut at) == 0 {
+                TAKEN.store(false, Relaxed);
+                return Mouse::default();
+            }
+            let picture = info.rcClient;
+            let (left, right) = (GetAsyncKeyState(0x01) < 0, GetAsyncKeyState(0x02) < 0);
+            if !held.taken {
+                TAKEN.store(false, Relaxed);
+                let over =
+                    at.x >= picture.left && at.x < picture.right && at.y >= picture.top && at.y < picture.bottom;
+                let clicked = left && !held.left && over;
+                held.left = left;
+                if !clicked {
+                    return Mouse::default();
+                }
+                (held.taken, held.fresh, held.click, held.x, held.y) = (true, true, true, 0.0, 0.0);
+            }
+            held.left = left;
+            held.click &= left;
+            let left = left && !held.click;
+            if !TAKEN.swap(true, Relaxed) && BEFORE[0].load(Relaxed) == 0 {
+                let own = GetWindowLongPtrW(hwnd, GWLP_WNDPROC);
+                if own != 0 {
+                    BEFORE[1].store(own, Relaxed);
+                    BEFORE[0].store(hwnd as isize, Relaxed);
+                    SetWindowLongPtrW(hwnd, GWLP_WNDPROC, hidden as *const () as usize as isize);
+                }
+            }
+            let middle = ((picture.left + picture.right) / 2, (picture.top + picture.bottom) / 2);
+            // (the first reading after it is taken: where the pointer was says nothing)
+            let (dx, dy) = if held.fresh { (0, 0) } else { (at.x - middle.0, at.y - middle.1) };
+            held.fresh = false;
+            SetCursorPos(middle.0, middle.1);
+            // About 8 pixels a reading (1000 a second) is the stick at its end.
+            const GAIN: f32 = 0.025;
+            held.x = held.x * 0.8 + dx as f32 * GAIN * *SCALE;
+            held.y = held.y * 0.8 + dy as f32 * GAIN * *SCALE;
+            Mouse {
+                left,
+                right,
+                x: held.x.clamp(-1.0, 1.0),
+                y: (-held.y).clamp(-1.0, 1.0),
+            }
+        }
     }
 
     /// The foreground window is one of ours (the title's or our fallback).
@@ -1659,33 +1788,5 @@ mod tests {
         rumble(&hub.devices[FALLBACK], &[1.0; 4]);
         rumble(device, std::ptr::null());
         assert_eq!(host.lock().unwrap().rumble, [(2, 32767, 65535), (2, 0, 0)]);
-    }
-}
-
-#[cfg(test)]
-mod mouse_tests {
-    use super::*;
-
-    #[test]
-    fn the_mouse_adds_to_the_right_stick_and_pulls_triggers() {
-        let pad = PadState {
-            right_x: 0.9,
-            ..Default::default()
-        };
-        let m = MouseInput {
-            right_x: 0.5,
-            right_y: -0.3,
-            left: true,
-            right: false,
-            middle: true,
-        };
-        let out = with_mouse(pad, &m);
-        assert_eq!(out.right_x, 1.0);
-        assert_eq!(out.right_y, -0.3);
-        assert_eq!(out.right_trigger, 1.0);
-        assert_eq!(out.left_trigger, 0.0);
-        assert_eq!(out.buttons & RIGHT_STICK, RIGHT_STICK);
-        // No mouse: the pad unchanged.
-        assert_eq!(with_mouse(pad, &MouseInput::default()), pad);
     }
 }

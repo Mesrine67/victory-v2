@@ -21,8 +21,6 @@ pub(crate) enum C {
     Queries,
     QueryUs,
     MoveUs,
-    /// Bytes copied by a plain `memcpy` instead of a kernel call.
-    MoveFast,
     Unmapped,
     /// Write-watch askings and their time.
     Watches,
@@ -88,12 +86,6 @@ pub(crate) enum C {
     /// Texture uploads recorded, and left out as unchanged.
     TexUploads,
     TexSkipped,
-    /// Texture subresources detiled and their bytes, and of them the ones
-    /// detiled in bands on several threads (`texture::detile_wide`).
-    TexDetiled,
-    TexDetiledBytes,
-    TexBanded,
-    TexBandedBytes,
     /// Held submissions a present ran although their waits were not met.
     Forced,
     /// Ranges named through unordered access views by shaders that cannot
@@ -135,6 +127,12 @@ pub(crate) enum C {
     WaitsForGroups,
     WaitsForBuffers,
     IndirectBounded,
+    /// `watch::writes` kernel askings that failed (the range is not
+    /// write-watched: view memory or not watchable).
+    WatchFailed,
+    /// `watch::writes` askings not made because the range's first block is
+    /// already known to be guarded view memory (no kernel call).
+    WatchKnownView,
 }
 const COUNTERS: usize = 80;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
@@ -300,9 +298,11 @@ fn own(size: usize, made: bool) {
     if made {
         OWN[class].fetch_add(size as u64, Relaxed);
         OWN[4 + class].fetch_add(1, Relaxed);
+        victory_core::heapcount::grow(size);
     } else {
         OWN[class].fetch_sub(size as u64, Relaxed);
         OWN[4 + class].fetch_sub(1, Relaxed);
+        victory_core::heapcount::shrink(size);
     }
 }
 
@@ -698,6 +698,11 @@ fn log_memory() {
     let card = crate::host::host()
         .and_then(|h| h.video_memory())
         .unwrap_or_default();
+    // Everything the system says of the two memory groups, beside the
+    // budget and use the lines below print.
+    if let Some(h) = crate::host::host() {
+        h.log_video_memory("with the memory line");
+    }
     // What else holds memory: the map, on a thread of its own, with every
     // sixth line; and what the shader table and the pipeline library keep.
     static LINES: AtomicU64 = AtomicU64::new(0);
@@ -745,6 +750,22 @@ fn log_memory() {
         mb(card[1]),
         mb(card[0]),
         mb(card[3]),
+    );
+    let targets = crate::resource::targets_census();
+    tracing::info!(
+        "host copies the sweep never lets go: {} the host renders to or writes {:.0} MB ({} of them placed {:.0} MB);          of them {} have title memory that is not mapped now {:.0} MB, {} were not used for 30 s and are held by no          list and no slot {:.0} MB, {} are both {:.0} MB; and {} copies of textures the title fills that the host          copied into {:.0} MB",
+        targets[0],
+        mb(targets[1]),
+        targets[10],
+        mb(targets[11]),
+        targets[2],
+        mb(targets[3]),
+        targets[4],
+        mb(targets[5]),
+        targets[6],
+        mb(targets[7]),
+        targets[8],
+        mb(targets[9]),
     );
     tracing::info!(
         "memory let go since the start: {} windows outside buffers {:.0} MB, {} staging buffers \
@@ -1069,8 +1090,8 @@ pub(crate) fn log(frames: f64) {
     let ms = |v: f64| v / 1e3;
     tracing::info!(
         "copies per frame: {:.1} submissions; {:.0} title copies {:.1} MB; {:.0} refreshes {:.1} MB, \
-         {:.0} skipped {:.1} MB; {:.0} runs {:.1} ms; {:.0} queries {:.2} ms, moves {:.2} ms \
-         ({:.1} MB by memcpy), {:.2} MB unmapped; {:.0} page faults; {:.0} watches {:.2} ms, {:.1} MB checked, {:.1} MB \
+         {:.0} skipped {:.1} MB; {:.0} runs {:.1} ms; {:.0} queries {:.2} ms, moves {:.2} ms, \
+         {:.2} MB unmapped; {:.0} page faults; {:.0} watches {:.2} ms, {:.1} MB checked, {:.1} MB \
          unchanged; {:.1} fallbacks; {:.0} guard faults; textures {:.1} MB watched and \
          changed, {:.1} MB hashed, {:.1} MB of them changed",
         c[C::Submissions as usize],
@@ -1085,7 +1106,6 @@ pub(crate) fn log(frames: f64) {
         c[C::Queries as usize],
         ms(c[C::QueryUs as usize]),
         ms(c[C::MoveUs as usize]),
-        mb(c[C::MoveFast as usize]),
         mb(c[C::Unmapped as usize]),
         faults as f64 / frames,
         c[C::Watches as usize],
@@ -1147,8 +1167,7 @@ pub(crate) fn log(frames: f64) {
          until the first submission; {:.1} ms from the last submission to the present call; \
          lists reset in {:.1} ms; the process ran {user:.0} ms user + {kernel:.0} ms kernel on \
          all threads; what shaders wrote: {:.1} ms finding {:.0} pieces that differ, {:.1} ms \
-         putting them back; texture uploads: {:.0} recorded, {:.0} left out; {:.0} subresources \
-         detiled {:.1} MB, {:.0} of them in bands {:.1} MB; {:.1} held \
+         putting them back; texture uploads: {:.0} recorded, {:.0} left out; {:.1} held \
          submissions run at the present with their waits not met; waits for memory values: \
          {:.0} looks {:.1} ms; {:.0} host lists made {:.1} ms; {:.0} parts of held submissions \
          ran alone that the next part could have run with",
@@ -1161,10 +1180,6 @@ pub(crate) fn log(frames: f64) {
         ms(c[C::BackSyncUs as usize]),
         c[C::TexUploads as usize],
         c[C::TexSkipped as usize],
-        c[C::TexDetiled as usize],
-        c[C::TexDetiledBytes as usize] / 1e6,
-        c[C::TexBanded as usize],
-        c[C::TexBandedBytes as usize] / 1e6,
         c[C::Forced as usize],
         c[C::WaitChecks as usize],
         c[C::WaitCheckNs as usize] / 1e6,
@@ -1257,6 +1272,12 @@ pub(crate) fn log(frames: f64) {
             longest as f64 / 1e3
         );
     }
+    tracing::info!(
+        "  write-watch askings per frame that failed in the kernel: {:.0}; not made because the range \
+         is known guarded view memory: {:.0} (VICTORY_VIEW_ASK=1 asks the kernel anyway)",
+        c[C::WatchFailed as usize],
+        c[C::WatchKnownView as usize],
+    );
     tracing::info!(
         "  waits for every earlier shader write, per frame: {:.0} for the title's barrier groups, {:.0} \
          for its barriers on buffers; {:.0} indirect commands bounded (a dispatch of ours between two \

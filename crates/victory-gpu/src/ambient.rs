@@ -1,5 +1,8 @@
 //! A least amount of indirect light.
 //!
+//! (Neptune) Belobug's pass, taken as reddxd-byte/ShakiraRED-dt carries it (c2271e5,
+//! GPL-3.0-or-later); the hooks in `draw.rs` and `pipeline.rs` are theirs too.
+//!
 //! Grand Theft Auto VI's indirect diffuse light comes from probes it fills
 //! by tracing rays, which do not run here yet: its program that resolves
 //! them (`CS_ScreenProbes_TemporalResolve_*`) leaves next to nothing, and

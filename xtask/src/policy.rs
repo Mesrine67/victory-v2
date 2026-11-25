@@ -16,9 +16,6 @@ const MAX_ENCODED_RUN: usize = 512;
 const ALLOWED_EXTENSIONS: &[&str] = &[
     "rs", "toml", "md", "txt", "lock", "yml", "yaml", "json", "hlsl", "hlsli", "ps1", "cmd", "sh",
 ];
-/// Frametime dumps (`VICTORY_FRAMETIME_DUMP`) live here as CSV: small text
-/// of hardware, switches and frame counters, nothing from the game.
-const DUMP_DIR: &str = "dumps/";
 const ALLOWED_NAMES: &[&str] = &[
     ".gitignore",
     ".gitattributes",
@@ -150,9 +147,7 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
     let mut problems = Vec::new();
     let name = path.rsplit('/').next().unwrap_or(path);
     let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
-    let dump_csv = path.starts_with(DUMP_DIR) && ext.as_deref() == Some("csv");
     let allowed = ALLOWED_NAMES.contains(&name)
-        || dump_csv
         || ext
             .as_deref()
             .is_some_and(|e| ALLOWED_EXTENSIONS.contains(&e));

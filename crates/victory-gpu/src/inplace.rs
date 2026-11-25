@@ -276,20 +276,27 @@ struct Views {
     sections: Vec<(usize, u64, bool)>,
 }
 
-static VIEWS: std::sync::RwLock<Views> =
-    std::sync::RwLock::new(Views { views: BTreeMap::new(), pages: BTreeMap::new(), sections: Vec::new() });
+static VIEWS: Mutex<Views> =
+    Mutex::new(Views { views: BTreeMap::new(), pages: BTreeMap::new(), sections: Vec::new() });
 
-fn views_read() -> std::sync::RwLockReadGuard<'static, Views> {
-    VIEWS.read().unwrap_or_else(|e| e.into_inner())
-}
-
-fn views() -> std::sync::RwLockWriteGuard<'static, Views> {
-    VIEWS.write().unwrap_or_else(|e| e.into_inner())
+fn views() -> std::sync::MutexGuard<'static, Views> {
+    VIEWS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// The runtime made a section of `bytes` for physical pages; `committed`
 /// if with `SEC_COMMIT` (only such a section can be opened as a heap).
 pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
+    // (Neptune) A view of our own of a section this handle named before is of that one.
+    {
+        let mut aliases = ALIASES.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(at) = aliases.iter().position(|a| a.0 == section) {
+            let (_, host, _) = aliases.swap_remove(at);
+            if host != 0 {
+                // SAFETY: a view this module mapped.
+                unsafe { mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS { Value: host as *mut c_void }) };
+            }
+        }
+    }
     let mut v = views();
     v.sections.retain(|s| s.0 != section);
     v.sections.push((section, bytes, committed));
@@ -344,7 +351,7 @@ pub(crate) fn views_between(start: usize, end: usize) -> Vec<(usize, usize)> {
     if start >= end {
         return Vec::new();
     }
-    let v = views_read();
+    let v = views();
     let mut out = Vec::new();
     if let Some((&base, &(bytes, _, _))) = v.views.range(..=start).next_back()
         && base + bytes > start
@@ -357,10 +364,48 @@ pub(crate) fn views_between(start: usize, end: usize) -> Vec<(usize, usize)> {
     out
 }
 
+/// (Neptune) Views of our own of the title's sections, whole and writable, by the section's
+/// handle: the address (0: it could not be mapped) and the section's bytes.
+static ALIASES: Mutex<Vec<(usize, usize, u64)>> = Mutex::new(Vec::new());
+
+/// (Neptune) Where the bytes of title view memory `[at, at + len)` are in a view of our own of
+/// the same section: the same physical pages at an address the guards know nothing of.
+/// What is written there is in title memory at once, with no protection changed and no
+/// fault; who writes there tells the journal itself (`crate::watch::ours_through`).
+/// `None` if the range is not inside one title view, or the section cannot be mapped.
+pub(crate) fn host_alias(at: usize, len: usize) -> Option<*mut u8> {
+    let (within, bytes, section, offset, size) = {
+        let v = views();
+        let (&base, &(bytes, section, offset)) = v.views.range(..=at).next_back()?;
+        let size = v.sections.iter().find(|s| s.0 == section).map(|s| s.1)?;
+        (at.checked_sub(base)?, bytes, section, offset, size)
+    };
+    if len == 0 || within.checked_add(len)? > bytes || offset + (within + len) as u64 > size {
+        return None;
+    }
+    let mut aliases = ALIASES.lock().unwrap_or_else(|e| e.into_inner());
+    let host = match aliases.iter().find(|a| a.0 == section) {
+        Some(a) => a.1,
+        None => {
+            // SAFETY: a section handle the runtime gave; the whole section, to read and write.
+            let host = unsafe { mem::MapViewOfFile(section as _, mem::FILE_MAP_READ | mem::FILE_MAP_WRITE, 0, 0, 0) }.Value as usize;
+            tracing::info!(
+                section = format_args!("{section:#x}"),
+                mb = size >> 20,
+                mapped = host != 0,
+                "a view of our own of a title section, for what shaders wrote to go into title memory through (VICTORY_QUIET_BACK=1)"
+            );
+            aliases.push((section, host, size));
+            host
+        }
+    };
+    (host != 0).then(|| (host + offset as usize + within) as *mut u8)
+}
+
 /// The address of the 64 KiB page shown at `page` in every title view that
 /// shows it, `page`'s own address included; empty if `page` is not a view.
 pub(crate) fn pages_of(page: usize) -> Vec<usize> {
-    let v = views_read();
+    let v = views();
     let Some((&base, &(bytes, section, offset))) = v.views.range(..=page).next_back() else {
         return Vec::new();
     };
@@ -378,7 +423,7 @@ pub(crate) fn views_of_section(section: usize, offset: u64, len: usize) -> Vec<(
     if len == 0 {
         return Vec::new();
     }
-    let v = views_read();
+    let v = views();
     let end = offset.saturating_add(len as u64);
     let mut pages: Vec<usize> = Vec::new();
     let mut at = offset - offset % K64 as u64;
@@ -436,117 +481,9 @@ fn cover_in(views: &BTreeMap<usize, (usize, usize, u64)>, at: usize, len: usize)
     if one { Cover::Run(first.0, first.1) } else { Cover::Scattered }
 }
 
-/// Whether what shaders wrote goes back into title view memory through a
-/// permanently writable view of our own (`VICTORY_BACK_OWN_VIEW=0` disables),
-/// leaving the title's view read-only (guarded) so copy-back incurs zero
-/// `VirtualProtect` TLB shootdowns and the copy that wrote it need not
-/// re-copy the same 64 KiB page back up on the next frame.
-pub(crate) fn back_own() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_BACK_OWN_VIEW").is_none_or(|v| v != "0"))
-}
-
-struct Own {
-    base: usize,
-    bytes: u64,
-    committed: Vec<AtomicU64>,
-}
-
-static OWN: std::sync::RwLock<Option<std::collections::HashMap<usize, Option<Own>>>> = std::sync::RwLock::new(None);
-
-/// Stores `bytes` at title address `at` through a writable view of our own
-/// on the same physical section. Returns the addresses of that 64 KiB page
-/// in every title view showing it, or `None` with nothing written.
-pub(crate) fn write_own(at: usize, bytes: &[u8]) -> Option<Vec<usize>> {
-    if bytes.is_empty() || at / K64 != (at + bytes.len() - 1) / K64 {
-        return None;
-    }
-    let _still = crate::watch::title_memory_reading_now()?;
-    let (section, offset, shown, section_bytes) = {
-        let v = views_read();
-        let (&base, &(len, section, offset)) = v.views.range(..=at).next_back()?;
-        if at + bytes.len() > base + len {
-            return None;
-        }
-        let offset = offset + (at - base) as u64;
-        let shown = v.pages.get(&(section, offset - offset % K64 as u64))?.clone();
-        if shown.len() > crate::watch::MANY_VIEWS {
-            return None;
-        }
-        let section_bytes = v.sections.iter().find(|s| s.0 == section)?.1;
-        (section, offset, shown, section_bytes)
-    };
-    if offset + bytes.len() as u64 > section_bytes {
-        return None;
-    }
-    let block = offset as usize / K64;
-    let bit = 1u64 << (block % 64);
-    // Fast path: section already mapped and 64 KiB block already committed under shared read lock.
-    let fast_base: Option<usize> = {
-        let own = OWN.read().unwrap_or_else(|e| e.into_inner());
-        own.as_ref()
-            .and_then(|map| map.get(&section))
-            .and_then(|entry| entry.as_ref())
-            .filter(|view| {
-                offset + bytes.len() as u64 <= view.bytes
-                    && (view.committed[block / 64].load(Ordering::Acquire) & bit) != 0
-            })
-            .map(|view| view.base)
-    };
-    let view_base = if let Some(base) = fast_base {
-        base
-    } else {
-        let mut own = OWN.write().unwrap_or_else(|e| e.into_inner());
-        let view = own
-            .get_or_insert_with(Default::default)
-            .entry(section)
-            .or_insert_with(|| {
-                // SAFETY: a section handle the runtime gave us, alive while title views of it exist.
-                let mapped = unsafe { mem::MapViewOfFile(section as *mut c_void, mem::FILE_MAP_WRITE, 0, 0, 0) };
-                if mapped.Value.is_null() {
-                    tracing::warn!(
-                        section,
-                        error = %std::io::Error::last_os_error(),
-                        "no view of our own on a section of title pages: what shaders wrote goes back the old way there"
-                    );
-                    return None;
-                }
-                tracing::info!(
-                    section,
-                    mb = section_bytes >> 20,
-                    "a view of our own on a section of title pages, for what shaders wrote (VICTORY_BACK_OWN_VIEW=1)"
-                );
-                let words = (section_bytes as usize).div_ceil(K64).div_ceil(64);
-                Some(Own {
-                    base: mapped.Value as usize,
-                    bytes: section_bytes,
-                    committed: (0..words).map(|_| AtomicU64::new(0)).collect(),
-                })
-            })
-            .as_ref()?;
-        if offset + bytes.len() as u64 > view.bytes {
-            return None;
-        }
-        if (view.committed[block / 64].load(Ordering::Acquire) & bit) == 0 {
-            // SAFETY: a 64 KiB block inside our own mapped view.
-            let there = unsafe {
-                mem::VirtualAlloc((view.base + block * K64) as *const c_void, K64, mem::MEM_COMMIT, mem::PAGE_READWRITE)
-            };
-            if there.is_null() {
-                return None;
-            }
-            view.committed[block / 64].fetch_or(bit, Ordering::Release);
-        }
-        view.base
-    };
-    // SAFETY: committed writable bytes inside our own persistent view; source is `bytes`.
-    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), (view_base + offset as usize) as *mut u8, bytes.len()) };
-    Some(shown)
-}
-
 /// [`Cover`] of `[at, at + len)` by the title's views as they are now.
 pub(crate) fn cover(at: usize, len: usize) -> Cover {
-    cover_in(&views_read().views, at, len)
+    cover_in(&views().views, at, len)
 }
 
 /// Whether `[at, at + len)` is private memory, all committed and
@@ -1092,7 +1029,7 @@ fn census_of(spans: &[(u64, u64, bool)]) -> Vec<String> {
             }
         }
     }
-    let v = views_read();
+    let v = views();
     let (count, bytes) = (v.views.len(), v.views.values().map(|view| view.0 as u64).sum::<u64>());
     let pages = v.views.values().filter(|view| view.0 == K64).count();
     let big = v.views.values().map(|view| view.0).max().unwrap_or(0);

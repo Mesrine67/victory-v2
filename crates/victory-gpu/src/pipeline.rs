@@ -61,6 +61,8 @@ pub(crate) struct Shader {
     /// The first 8 bytes of its BLAKE3, as logged.
     pub(crate) hash: String,
     container: Vec<u8>,
+    /// Whether it is the program that resolves the indirect diffuse light
+    /// (`crate::ambient`).
     #[cfg(windows)]
     pub(crate) resolves_light: bool,
     #[cfg(windows)]
@@ -122,9 +124,6 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
         .clone()
 }
 
-#[cfg(windows)]
-pub(crate) use host::depth_bounds_test;
-
 /// Puts the translation of a container of the title's into the cache on
 /// disk, and with `compute` its host pipeline into the driver's, before any
 /// run wants them. Whether it translated, and whether it has a pipeline
@@ -153,10 +152,56 @@ pub(crate) struct Translated {
     /// Whether the shader's code can store to buffer memory ([`stores`]);
     /// true when its code is not known.
     pub(crate) stores: bool,
+    /// The host DXIL, moved out of `host`: read only to make a pipeline. With
+    /// `VICTORY_DROP_DXIL=1` it is let go after each pipeline and translated
+    /// again (the disk cache) when another needs it ([`Shader::dxil`]).
+    dxil: Mutex<Option<Arc<Vec<u8>>>>,
 }
+
+/// `VICTORY_DROP_DXIL=1` (off by default): shaders' host DXIL is let go once their pipeline is
+/// made; every translated shader keeps it for good otherwise.
+#[cfg(windows)]
+pub(crate) fn drop_dxil() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DROP_DXIL").is_some_and(|v| v == "1"))
+}
+
+/// DXIL bytes let go, times and bytes brought back, for the ram line.
+#[cfg(windows)]
+pub(crate) static DXIL_DROPS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 #[cfg(windows)]
 impl Shader {
+    /// The host DXIL of a translated shader: kept, or translated again from the container
+    /// (a hit in the shader cache) after [`Shader::release_dxil`].
+    pub(crate) fn dxil(&self) -> Option<Arc<Vec<u8>>> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let t = self.translated()?;
+        let mut held = t.dxil.lock().unwrap_or_else(|e| e.into_inner());
+        if held.is_none() {
+            let again = crate::shader_cache::host_shader(&self.container).ok()?.dxil;
+            DXIL_DROPS[1].fetch_add(1, Relaxed);
+            DXIL_DROPS[2].fetch_add(again.len() as u64, Relaxed);
+            KEPT[3].fetch_add(again.len() as u64, Relaxed);
+            *held = Some(Arc::new(again));
+        }
+        held.clone()
+    }
+
+    /// With `VICTORY_DROP_DXIL=1`: lets the host DXIL go (a pipeline being made holds its own
+    /// `Arc` until it is done).
+    pub(crate) fn release_dxil(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if !drop_dxil() {
+            return;
+        }
+        let Some(Some(t)) = self.translated.get() else { return };
+        if let Some(d) = t.dxil.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            KEPT[3].fetch_sub(d.len() as u64, Relaxed);
+            DXIL_DROPS[0].fetch_add(d.len() as u64, Relaxed);
+        }
+    }
+
     /// The translation, made on first use; a shader that does not
     /// translate is logged once.
     pub(crate) fn translated(&self) -> Option<&Translated> {
@@ -171,12 +216,12 @@ impl Shader {
                     let stem = format!("{}.{}", self.hash, self.stage);
                     let _ = std::fs::write(dir.join(format!("{stem}.cdxil")), &self.container);
                     if let Ok(t) = &done {
-                        let _ = std::fs::write(dir.join(format!("{stem}.dxil")), &t.host.dxil);
+                        let _ = std::fs::write(dir.join(format!("{stem}.dxil")), t.dxil.lock().unwrap_or_else(|e| e.into_inner()).as_deref().map_or(&[][..], |d| &d[..]));
                     }
                 }
                 if let Ok(t) = &done {
                     KEPT[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    KEPT[3].fetch_add(t.host.dxil.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                    KEPT[3].fetch_add(t.dxil.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(0, |d| d.len() as u64), std::sync::atomic::Ordering::Relaxed);
                 }
                 match &done {
                     Ok(t) => tracing::info!(
@@ -209,7 +254,8 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         Some(part) => victory_shader::native_programs(part.data).map_err(|e| e.to_string())?,
         None => Vec::new(),
     };
-    let host = crate::shader_cache::host_shader(container)?;
+    let mut host = crate::shader_cache::host_shader(container)?;
+    let dxil = Mutex::new(Some(Arc::new(std::mem::take(&mut host.dxil))));
     let stores = programs.is_empty() || programs.iter().any(stores);
     let used = programs
         .into_iter()
@@ -221,7 +267,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         })
         .map(|p| p.used)
         .unwrap_or_default();
-    Ok(Translated { host, used, stores })
+    Ok(Translated { host, used, stores, dxil })
 }
 
 /// The compute pipelines of the console's ray-tracing structure builder
@@ -383,10 +429,6 @@ struct Pipeline {
     /// One of the ray-tracing structure builder's ([`Builder`]).
     #[cfg(windows)]
     builder: bool,
-    /// One with a shader of [`drop_shaders`]: never made on the host, its
-    /// draws and dispatches not run.
-    #[cfg(windows)]
-    dropped: bool,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
@@ -396,6 +438,17 @@ const GRAPHICS_STAGES: [&str; 5] = ["vertex", "pixel", "domain", "hull", "geomet
 fn pipeline<'a>(this: This) -> &'a Pipeline {
     // SAFETY: the title passes one of our pipelines.
     unsafe { &*this.cast::<Pipeline>() }
+}
+
+/// The stages and hashes of title pipeline `this`, as `[mesh 0123..,
+/// pixel 4567..]` (diagnostics); "no pipeline" for none.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn shaders_of(this: This) -> String {
+    if this.is_null() {
+        return "no pipeline".to_owned();
+    }
+    let names: Vec<String> = pipeline(this).shaders.iter().map(|s| format!("{} {}", s.stage, s.hash)).collect();
+    format!("[{}]", names.join(", "))
 }
 
 /// List method: logs each pipeline's shaders the first time a list binds
@@ -432,35 +485,10 @@ pub(crate) fn making() -> u64 {
 }
 
 /// Draws and dispatches dropped since the last [`take_drops`], by reason
-/// (diagnostics).
-#[cfg(all(windows, feature = "diagnostics"))]
+/// (Neptune: in every build, so that a release run says which pipelines its dropped
+/// draws were for).
+#[cfg(windows)]
 static DROPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
-
-/// Shader hashes whose pipelines are dropped ([`drop_shaders`]).
-#[cfg(windows)]
-static DROPPED_SHADERS: OnceLock<std::collections::HashSet<String>> = OnceLock::new();
-
-/// Pipelines made with any of these shaders (16-digit hashes, the first 8
-/// bytes of the container's BLAKE3, as in the pipeline diagnostics) are not
-/// made on the host, and their draws and dispatches are not run; in every
-/// build, unlike `VICTORY_SKIP_PIPELINES`. Set once, before the title makes
-/// pipelines (the front end's `VICTORY_RT_OFF`); later sets are ignored.
-pub fn drop_shaders(hashes: std::collections::HashSet<String>) {
-    #[cfg(windows)]
-    let _ = DROPPED_SHADERS.set(hashes);
-    #[cfg(not(windows))]
-    let _ = hashes;
-}
-
-/// Pipelines made dropped ([`drop_shaders`]).
-pub static DROPPED_PIPELINES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-#[cfg(windows)]
-fn dropped(shaders: &[Arc<Shader>]) -> bool {
-    DROPPED_SHADERS
-        .get()
-        .is_some_and(|d| shaders.iter().any(|s| d.contains(&s.hash)))
-}
 
 /// Shader hashes as printed in the pipeline diagnostics.
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -499,50 +527,44 @@ fn skipped_shader(p: &Pipeline) -> Option<&str> {
         .map(|shader| shader.hash.as_str())
 }
 
-/// Whether draws and dispatches of `this` are not run: dropped
-/// ([`drop_shaders`]) or, in diagnostics builds, skipped
-/// (`VICTORY_SKIP_PIPELINES`).
-#[cfg(windows)]
+#[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn is_skipped(this: This) -> bool {
-    if this.is_null() {
-        return false;
-    }
-    let p = pipeline(this);
-    #[cfg(feature = "diagnostics")]
-    if skipped_shader(p).is_some() {
-        return true;
-    }
-    p.dropped
+    !this.is_null() && skipped_shader(pipeline(this)).is_some()
 }
 
 /// Counts a draw or dispatch of `this` intentionally skipped or dropped
 /// for want of a host pipeline (diagnostics).
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 pub(crate) fn note_drop(this: This) {
     let why = if this.is_null() {
-        Some("no pipeline set".to_owned())
+        "no pipeline set".to_owned()
     } else {
         let p = pipeline(this);
-        skipped_shader(p)
-            .map(|hash| format!("skipped shader {hash}"))
-            .or_else(|| p.dropped.then(|| "ray tracing, off (VICTORY_RT_OFF)".to_owned()))
-            .or_else(|| make::missing(&p.host))
+        #[cfg(feature = "diagnostics")]
+        let skipped = skipped_shader(p).map(|hash| format!("skipped shader {hash}"));
+        #[cfg(not(feature = "diagnostics"))]
+        let skipped: Option<String> = None;
+        skipped.or_else(|| make::missing(&p.host)).unwrap_or_else(|| {
+            // (Neptune) Its host pipeline is there: the draw was left out for another
+            // reason (its views or buffers could not be made ready, or a filter of ours).
+            let shaders: Vec<String> = p.shaders.iter().map(|s| format!("{} {}", s.stage, s.hash)).collect();
+            format!("pipeline made, draw not run [{}]", shaders.join(", "))
+        })
     };
-    if let Some(why) = why {
-        note_why(why);
-    }
+    note_why(why);
 }
 
 /// Counts a draw or dispatch dropped for `why` (diagnostics).
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 pub(crate) fn note_why(why: String) {
+    #[cfg(feature = "diagnostics")]
     crate::capture::op(0, || format!("DROPPED {why}"));
     let mut drops = DROPS.lock().unwrap_or_else(|e| e.into_inner());
     *drops.get_or_insert_with(HashMap::new).entry(why).or_default() += 1;
 }
 
 /// The drops counted since the last call, most first (diagnostics).
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 pub(crate) fn take_drops() -> Vec<(String, u64)> {
     let drops = DROPS.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut drops: Vec<(String, u64)> = drops.into_iter().flatten().collect();
@@ -573,13 +595,7 @@ fn hand_out(
     #[cfg(windows)]
     let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
     #[cfg(windows)]
-    let dropped = dropped(&shaders);
-    #[cfg(windows)]
-    if dropped {
-        DROPPED_PIPELINES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    } else {
-        make::early(&host);
-    }
+    make::early(&host);
     #[cfg(windows)]
     let builder = of_builder(&shaders);
     #[cfg(windows)]
@@ -596,8 +612,6 @@ fn hand_out(
         host,
         #[cfg(windows)]
         builder,
-        #[cfg(windows)]
-        dropped,
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
     });

@@ -25,6 +25,10 @@ static IMAGE_PATHS: Mutex<Vec<(usize, PathBuf)>> = Mutex::new(Vec::new());
 /// Records the file a title image was mapped from: the title asks for its
 /// own path (`GetModuleFileName`) to find its data, and must not get our
 /// cache copy.
+pub fn set_image_size(base: usize, size: usize) {
+    victory_gpu::titlemem::title_range(base, size, victory_gpu::titlemem::IMAGE);
+}
+
 pub fn set_image_path(base: usize, path: &Path) {
     let path = std::path::absolute(path).unwrap_or_else(|_| path.to_owned());
     let mut paths = IMAGE_PATHS.lock().unwrap_or_else(|e| e.into_inner());
@@ -34,6 +38,7 @@ pub fn set_image_path(base: usize, path: &Path) {
 
 /// Forgets a title image that was unmapped again.
 pub fn forget_image(base: usize) {
+    victory_gpu::titlemem::title_range_free(base);
     let mut paths = IMAGE_PATHS.lock().unwrap_or_else(|e| e.into_inner());
     paths.retain(|(b, _)| *b != base);
 }
@@ -186,18 +191,12 @@ pub fn use_console_timers() {
     use windows_sys::Win32::Media::timeBeginPeriod;
     use windows_sys::Win32::System::Threading::{
         GetCurrentProcess, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
-        PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
         PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, PROCESS_POWER_THROTTLING_STATE,
         ProcessPowerThrottling, SetProcessInformation,
     };
-    let execution = if std::env::var_os("VICTORY_EFFICIENCY_MODE").is_some_and(|v| v == "1") {
-        0
-    } else {
-        PROCESS_POWER_THROTTLING_EXECUTION_SPEED
-    };
     let keep = PROCESS_POWER_THROTTLING_STATE {
         Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
-        ControlMask: PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION | execution,
+        ControlMask: PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
         StateMask: 0,
     };
     // SAFETY: plain process settings; `keep` outlives the call.
