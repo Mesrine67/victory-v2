@@ -49,17 +49,48 @@ Neptune's own numbers (RTX 5070 Ti, i7-14700, 64 GB, Series S 720p → 1080p):
 | first room, Series S + FSR | 16–17 |
 | Series X (4K), first room | ~14 |
 
-On this 5080 / 9800X3D, with the warm shader and pipeline caches, `-SeriesX`:
+On this 5080 / 9800X3D, `-SeriesX`, warm shader cache, in the open-world test
+area used for the earlier numbers:
 
 | | |
 |---|---:|
-| fps | **TBD** |
-| ms/frame | **TBD** |
-| draws | **TBD** |
+| menu | **30 fps**, 13 draws, 0 dropped |
+| open world | **~9–12 fps / 83–116 ms** at ~4,900 draws |
+| denser stretch | 5–7 fps at 5,500–6,000 draws while mesh pipelines first-bind |
+| copy-back | 40–57 ms |
+| preparing | 43–49 ms |
+| shader cache | **3,630 hits, 0 misses** |
 
-For comparison, the earlier ShakiraRED V1 tree measured 17.8 fps median / 56 ms at
-~6,679 draws, with ~350–450 draws per frame dropped as refused compute shaders.
-Neptune's translator is what removes those drops.
+This is a preview, not a final benchmark. Two things dominate the gap:
+
+1. **Host mesh pipelines first-bind.** The shader cache is complete (0 misses),
+   but the host PSOs for mesh draws are made the first time an area uses them and
+   the library saves them afterwards. The first pass through an area drops those
+   draws; a second visit is smoother. We are working on pre-building the mesh
+   side the way the graphics/compute side already is.
+2. **VRAM is tight in the open world.** 11–15 GB of the 16 GB card, with 700–800
+   textures waiting at times. The interior scenes are much lighter.
+
+The earlier ShakiraRED V1 tree measured 17.8 fps / 56 ms at ~6,679 draws, but it
+dropped ~350–450 draws/frame as refused compute shaders. Neptune translates all
+but **5 of 25,753** shaders and **0 of 2,729** compute pipelines; the remaining gap
+is the two items above, not translation.
+
+### Profiles
+
+`play.ps1` uses the author's 12-thread set. On a 32 GB / 8-core machine, try the
+RAM-saving profile (also in `tools/start-neptune.ps1`):
+
+```bat
+set VICTORY_WIDE_THREADS=6
+set VICTORY_LIST_POOL_MB=512
+set VICTORY_TEXTURE_STAGE_MB=256
+set VICTORY_FAST_COPY=0
+```
+
+If textures are waiting, lower `VICTORY_CARD_WINDOWS_MB` (4096 → 3072 → 2048);
+if you have VRAM to spare, raise it. Raise `VICTORY_TEXTURE_ROOM_PERCENT` only
+with care (the author measured black textures at 75%).
 
 ## Build
 
