@@ -14,7 +14,7 @@ Tested on Windows with an NVIDIA RTX 4090 using the Series X profile. Numbers be
 | Separate V1 performance check | 12.8 FPS at approximately 5,508 draws |
 | High-load spike | 1.8 FPS at about 10,262 draws; 567 ms per frame |
 
-Samples are roughly one-second averages logged about every five seconds. The examples were not controlled camera-matched comparisons. Missing pipelines can reduce draw work, so FPS alone does not establish visual correctness. A separate run ended with `DXGI_ERROR_DEVICE_HUNG`; the exact GPU command responsible was not identified.
+The gameplay launch used `VICTORY_AMBIENT=0.6`, `VICTORY_CARD_BUFFERS_MB=4096`, `VICTORY_CARD_WINDOWS_MB=4096` and `VICTORY_WIDE_MERGE=1`, with a populated shader cache. Samples are roughly one-second averages logged about every five seconds. The examples were not controlled camera-matched comparisons. Missing pipelines can reduce draw work, so FPS alone does not establish visual correctness. A separate run ended with `DXGI_ERROR_DEVICE_HUNG`; the exact GPU command responsible was not identified.
 
 ## Changes in V1
 
