@@ -62,6 +62,43 @@ is idle — i.e. asset binding/streaming, not GPU and not the file-read path. `c
 cost and are not attributed yet. Full sample writeup: `crates/victory-gpu/src/frametime.rs` and the
 dump itself.
 
+## Capture a frametime dump
+
+### In short (person)
+1. Merge/pull this repo and **build the exe**:
+   ```sh
+   cargo build --release -p victory
+   ```
+   Pulling the source is not a build. Use the exe you just built.
+2. Run the title with the dump on:
+   ```bat
+   run-frametime.cmd "D:\game\game.exe"
+   ```
+   or, in the same `cmd` window:
+   ```bat
+   set VICTORY_FRAMETIME_DUMP=1
+   target\release\victory.exe run "D:\game\game.exe" --execute
+   ```
+3. Play into the world for 2–3 minutes, then send
+   `%LOCALAPPDATA%\victory\cache\frametime.csv` (see
+   [Where the dump goes](#where-the-dump-goes)). Add it under `dumps/` or post it.
+
+### Copy this to an agent
+> Merge or clone `https://github.com/skornuta/victory-fork` (`main`), run
+> `cargo build --release -p victory`, then run the title with `VICTORY_FRAMETIME_DUMP=1`
+> (or `run-frametime.cmd "<title.exe>"`). Confirm the log prints `frametime dump path=...`;
+> the CSV is at `%LOCALAPPDATA%\victory\cache\frametime.csv` (`victory config` prints
+> `cache_dir`). Let it reach the world and run 2–3 minutes, then return the CSV. Do not modify
+> or copy the game files.
+
+### If no file appears
+- `git pull` without `cargo build --release -p victory` → still the old exe, no dump.
+- Running a `victory.exe` from another folder or profile → run `target\release\victory.exe`.
+- No `frametime dump path=...` in the log → that build has no dump, or it never presented a frame.
+- Pre-`646f5cf` builds wrote `=1` to `%TEMP%\victory-frametime.csv`.
+- PowerShell does not expand `%LOCALAPPDATA%`; use `$env:LOCALAPPDATA` or the `.cmd`.
+- The file appears on the first presented frame (~1 s), not at launch.
+
 ## Community dumps
 
 `dumps/` holds frametime CSVs captured on real machines, with a short index in
@@ -121,9 +158,9 @@ The log also prints `frametime dump path=...` when it opens.
 In PowerShell, use `$env:VICTORY_FRAMETIME_DUMP = '1'` — `%TEMP%`/`%LOCALAPPDATA%` are not expanded
 there.
 
-Every dump starts with `#` lines naming the machine (CPU, GPU + VRAM, RAM, OS, board, display) and
-the `VICTORY_*` switches, then the CSV header and rows. `pandas.read_csv(path, comment='#')` reads
-it directly.
+Every dump starts with `#` lines naming the machine (CPU, GPU + VRAM, driver, RAM, OS, board,
+display) and the `VICTORY_*` switches, then the CSV header and rows. `pandas.read_csv(path,
+comment='#')` reads it directly.
 
 ## Known issues
 

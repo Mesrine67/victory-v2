@@ -1,5 +1,7 @@
 # Community frametime dumps
 
+To capture one, see [Capture a frametime dump](../README.md#capture-a-frametime-dump).
+
 CSV captures from `VICTORY_FRAMETIME_DUMP=1` on real machines, for comparing the frame buckets and
 the 1–2 s drops across hardware. Each file is one run. When the `#` header is present it names the
 CPU, GPU + VRAM, RAM, OS, board, display and the `VICTORY_*` switches, so the run is reproducible.
