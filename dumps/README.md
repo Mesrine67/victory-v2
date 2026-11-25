@@ -8,8 +8,9 @@ CPU, GPU + VRAM, driver, RAM, OS, board, display and the `VICTORY_*` switches, s
 
 | File | Build | Captured | Machine | Run |
 |---|---|---|---|---|
-| [`frametime_skornuta_cd86c4d_2026-11-25_world.csv`](frametime_skornuta_cd86c4d_2026-11-25_world.csv) | `cd86c4d` | 2026-11-25 00:04 | not recorded — capture predates the `#` header; presumed skornuta's RTX 5080 / 9800X3D | reaches the world; max 8,428 draws/frame, last 3.4 fps, `heap_ms` peaks ~1.4 s |
 | [`frametime_skornuta_5080_9800x3d_931bee3_2026-11-25_fold-world.csv`](frametime_skornuta_5080_9800x3d_931bee3_2026-11-25_fold-world.csv) | `931bee3` | 2026-11-25 06:37 | RTX 5080 / Ryzen 7 9800X3D / 32 GB DDR5-6400 / Win11 26300 / driver 621.24 | world with fold on, ~12 min, 628 intervals; settled 4.7 fps / 226 ms, 5,636 draws |
+| [`frametime_blackbu7let_rx6900xt_r5-3600_9292987_2026-11-25_world.csv`](frametime_blackbu7let_rx6900xt_r5-3600_9292987_2026-11-25_world.csv) | `9292987` | 2026-11-25 09:16 | AMD RX 6900 XT / Ryzen 5 3600 / 32 GB / Win10 22H2 19045 / driver 32.0.21045.29003 | world scan window, 145 intervals (~175 s); from issue #2 |
+| [`frametime_woreksami_rtx3060_i9-14900k_2026-11-25_first-scene.csv`](frametime_woreksami_rtx3060_i9-14900k_2026-11-25_first-scene.csv) | fxceless `9376fd6` + PRs | 2026-11-25 | RTX 3060 8 GB / i9-14900K / 32 GB / Win11 25H2 26200 / driver 610.88 | first gameplay scene, 199 intervals; from issue #4 |
 
 ## Adding a dump
 
