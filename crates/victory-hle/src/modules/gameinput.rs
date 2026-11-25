@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 
 use super::xasync::{E_INVALIDARG, E_NOTIMPL};
 use super::xgameruntime::{HRESULT, S_OK};
+use super::mouse::MouseInput;
 use crate::{HleExport, HleModule};
 
 /// The documented errors.
@@ -113,6 +114,30 @@ trait Source: Send {
     fn keys(&mut self) -> Vec<KeyState>;
     /// Motor speeds: low frequency (left), high frequency (right).
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
+    /// What the captured mouse adds to the pad the title reads.
+    fn mouse(&mut self) -> MouseInput {
+        MouseInput::default()
+    }
+}
+
+/// The mouse on top of a pad: right stick added (capped), buttons pull the
+/// triggers (left button the right trigger) and click the right stick.
+fn with_mouse(mut pad: PadState, m: &MouseInput) -> PadState {
+    if *m == MouseInput::default() {
+        return pad;
+    }
+    pad.right_x = (pad.right_x + m.right_x).clamp(-1.0, 1.0);
+    pad.right_y = (pad.right_y + m.right_y).clamp(-1.0, 1.0);
+    if m.left {
+        pad.right_trigger = 1.0;
+    }
+    if m.right {
+        pad.left_trigger = 1.0;
+    }
+    if m.middle {
+        pad.buttons |= RIGHT_STICK;
+    }
+    pad
 }
 
 fn fallback(keys: &[KeyState]) -> PadState {
@@ -401,12 +426,12 @@ impl Hub {
 
     /// Reads the host once; device callbacks run on the calling thread.
     fn poll(&self) {
-        let (pads, keys) = {
+        let (pads, keys, mouse) = {
             let mut source = lock(&self.source);
             let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
-            (pads, source.keys())
+            (pads, source.keys(), source.mouse())
         };
-        let events = self.state().poll(&self.devices, pads, keys);
+        let events = self.state().poll(&self.devices, pads, keys, mouse);
         self.deliver(events);
     }
 
@@ -449,16 +474,21 @@ impl State {
     fn poll(
         &mut self,
         devices: &[Device; DEVICES],
-        pads: [Option<PadState>; PADS],
+        mut pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
+        mouse: MouseInput,
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
         let any_pad = pads.iter().any(Option::is_some);
+        // The mouse goes to the first host pad, else to the stand-in.
+        if let Some(pad) = pads.iter_mut().flatten().next() {
+            *pad = with_mouse(*pad, &mouse);
+        }
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
-        let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys)));
+        let fallback = (!any_pad).then(|| Value::Pad(with_mouse(fallback(&keys), &mouse)));
         self.update(devices, FALLBACK, fallback, now, &mut events);
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
         events
@@ -1188,6 +1218,10 @@ mod host {
                 .collect()
         }
 
+        fn mouse(&mut self) -> MouseInput {
+            crate::modules::mouse::take()
+        }
+
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
             let speeds = XINPUT_VIBRATION {
                 wLeftMotorSpeed: low,
@@ -1625,5 +1659,33 @@ mod tests {
         rumble(&hub.devices[FALLBACK], &[1.0; 4]);
         rumble(device, std::ptr::null());
         assert_eq!(host.lock().unwrap().rumble, [(2, 32767, 65535), (2, 0, 0)]);
+    }
+}
+
+#[cfg(test)]
+mod mouse_tests {
+    use super::*;
+
+    #[test]
+    fn the_mouse_adds_to_the_right_stick_and_pulls_triggers() {
+        let pad = PadState {
+            right_x: 0.9,
+            ..Default::default()
+        };
+        let m = MouseInput {
+            right_x: 0.5,
+            right_y: -0.3,
+            left: true,
+            right: false,
+            middle: true,
+        };
+        let out = with_mouse(pad, &m);
+        assert_eq!(out.right_x, 1.0);
+        assert_eq!(out.right_y, -0.3);
+        assert_eq!(out.right_trigger, 1.0);
+        assert_eq!(out.left_trigger, 0.0);
+        assert_eq!(out.buttons & RIGHT_STICK, RIGHT_STICK);
+        // No mouse: the pad unchanged.
+        assert_eq!(with_mouse(pad, &MouseInput::default()), pad);
     }
 }

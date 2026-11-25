@@ -222,7 +222,7 @@ static IDLE: std::sync::Mutex<(Vec<Idle>, u64)> = std::sync::Mutex::new((Vec::ne
 /// between them (a list keeps scratch chunks over a reset only while lists
 /// do not share them, `VICTORY_SCRATCH_POOL=0`).
 #[cfg(windows)]
-const IDLE_MOST: (usize, u64) = (128, 256 << 20);
+const IDLE_MOST: (usize, u64) = (512, 256 << 20);
 
 /// Whether host lists that have run are used again (on by default;
 /// `VICTORY_LIST_POOL=0`: each is made new and thrown away, as before).
@@ -818,6 +818,7 @@ extern "system" fn copy_buffer_region(
     if let Some(list) = host_list(this)
         && let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
+        && !gpu_buffer_copy(list, to, from, len as usize)
     {
         list.defer_copy(to, from, len as usize);
     }
@@ -850,6 +851,9 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
         ) {
+            if to == from {
+                return;
+            }
             if unlike(dst, src) {
                 return;
             }
@@ -872,12 +876,77 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::buffer_bytes(dst),
             crate::resource::buffer_bytes(src),
         ) {
-            list.defer_copy(to, from, a.min(b) as usize);
+            if !gpu_buffer_copy(list, to, from, a.min(b) as usize) {
+                list.defer_copy(to, from, a.min(b) as usize);
+            }
         }
     }
     #[cfg(not(windows))]
     let _ = (this, dst, src);
 }
+
+/// Whether a title buffer copy runs on the card (`VICTORY_GPU_BUFFER_COPY`,
+/// on unless 0), only where the copy at submission on the CPU would read or
+/// write bytes a flight in the air may write: that copy has to wait for the
+/// flights to land (a settle, about one a frame in the world once the
+/// refresh settles were gone), where the card runs a copy in its queue's
+/// order, behind them, as the console does. The source's host copy is
+/// brought up to date first, the destination's range is declared written
+/// by the card (it comes back into title memory with what shaders wrote).
+/// False if it could not: the caller copies on the CPU as before.
+#[cfg(windows)]
+fn gpu_buffer_copy(list: &crate::host::HostList, to: *mut u8, from: *const u8, len: usize) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_GPU_BUFFER_COPY").is_none_or(|v| v != "0")) {
+        return false;
+    }
+    let (dst, src) = (to as usize, from as usize);
+    if len == 0
+        || !crate::host::late()
+        || !(crate::host::flights_write(src, src + len) || crate::host::flights_write(dst, dst + len))
+    {
+        return false;
+    }
+    let (Some(d), Some(s)) = (
+        crate::shadow::find(dst as u64, len as u64),
+        crate::shadow::find(src as u64, len as u64),
+    ) else {
+        return false;
+    };
+    // Both copies must hold the whole range, and one buffer may not copy
+    // over itself where the ranges overlap.
+    let (Some(d_at), Some(s_at)) = (d.offset_in(dst as u64), s.offset_in(src as u64)) else {
+        return false;
+    };
+    if d.left(dst as u64) < len as u64 || s.left(src as u64) < len as u64 {
+        return false;
+    }
+    if std::sync::Arc::ptr_eq(&d, &s) && src < dst + len && dst < src + len {
+        return false;
+    }
+    s.refresh(list, src as u64, len as u64);
+    d.refresh(list, dst as u64, len as u64);
+    d.gpu_writes(list, dst as u64, len as u64);
+    #[cfg(feature = "diagnostics")]
+    list.note_op(|| format!("title buffer copy on the card {src:#x} -> {dst:#x} ({len} bytes)"));
+    let uav = windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER {
+        Type: windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER_TYPE_UAV,
+        ..Default::default()
+    };
+    // SAFETY: an open list; both host copies are live and hold the ranges
+    // (checked above). Shaders' writes before the copy first, then the
+    // copy's before what follows.
+    unsafe {
+        list.list.ResourceBarrier(&[uav.clone()]);
+        list.list.CopyBufferRegion(&d.buffer, d_at, &s.buffer, s_at, len as u64);
+        list.list.ResourceBarrier(&[uav]);
+    }
+    GPU_BUFFER_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    true
+}
+
+/// Title buffer copies run on the card ([`gpu_buffer_copy`]).
+pub(crate) static GPU_BUFFER_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 extern "system" fn copy_resource_x(this: This, dst: This, src: This, _flags: u32) {
     copy_resource(this, dst, src);
@@ -984,6 +1053,9 @@ extern "system" fn copy_texture_region(
             let Some(texture) = crate::resource::host_resource(src.resource) else {
                 return;
             };
+            if to == texture && dst.kind == src.kind && dst.footprint.offset == src.footprint.offset {
+                return;
+            }
             list.twin_use(src.resource, false, false);
             if crate::texture::title_written(texture) {
                 crate::texture::upload(list, src.resource, texture);
@@ -1100,7 +1172,7 @@ fn read_back(
         list.list
             .CopyTextureRegion((&raw const to).cast(), 0, 0, 0, (&raw const from).cast(), host_box)
     };
-    list.defer_read_back(buffer, data, [row as usize, rows as usize, pitch as usize], src.resource);
+    list.defer_read_back(buffer, data, [row as usize, rows as usize, pitch as usize]);
     Ok(())
 }
 
@@ -1433,6 +1505,14 @@ extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mu
 /// nothing returned.
 extern "system" fn ignored_state(_: This) {}
 
+/// Depth bounds `(min, max)`.
+extern "system" fn depth_bounds(this: This, min: f32, max: f32) {
+    #[cfg(windows)]
+    with_state(this, |list, s| s.set_depth_bounds(list, min, max));
+    #[cfg(not(windows))]
+    let _ = (this, min, max);
+}
+
 /// The title's draw state (decision 0007, step 3), kept for its draws or
 /// set on the host list at once. Without a host GPU these do nothing.
 #[cfg(windows)]
@@ -1474,9 +1554,6 @@ mod state {
     }
     pub(super) extern "system" fn stencil_ref(this: This, reference: u32) {
         with_state(this, |list, s| s.set_stencil_ref(list, reference));
-    }
-    pub(super) extern "system" fn depth_bounds(this: This, min: f32, max: f32) {
-        with_state(this, |list, s| s.set_depth_bounds(list, min, max));
     }
     pub(super) extern "system" fn heaps(this: This, count: u32, heaps: *const This) {
         with_state(this, |_, s| s.set_heaps(items(heaps, count)));
@@ -1645,7 +1722,6 @@ mod state {
     pub(super) use super::ignored_state as index_buffer;
     pub(super) use super::ignored_state as scissors;
     pub(super) use super::ignored_state as stencil_ref;
-    pub(super) use super::ignored_state as depth_bounds;
     pub(super) use super::ignored_state as targets;
     pub(super) use super::ignored_state as topology;
     pub(super) use super::ignored_state as vertex_buffers;
@@ -2090,7 +2166,7 @@ const METHODS: [(usize, *const ()); 52] = [
     (52, clear_rtv as *const ()),                 // 0x1a0
     (59, execute_indirect as *const ()),          // 0x1d8 indirect
     (60, copy_memory as *const ()),               // 0x1e0
-    (68, state::depth_bounds as *const ()),       // 0x220 depth bounds
+    (68, depth_bounds as *const ()),              // 0x220 depth bounds
     (69, write32 as *const ()),                   // 0x228
     (70, write64 as *const ()),                   // 0x230
     (71, wait_value as *const ()),                // 0x238, 32 bits

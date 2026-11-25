@@ -22,6 +22,7 @@ pub mod gameinput;
 pub mod kernel;
 #[cfg(windows)]
 pub mod lifecycle;
+pub mod mouse;
 #[cfg(windows)]
 pub mod media;
 #[cfg(windows)]

@@ -18,20 +18,19 @@ pub fn run(
 
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
-    let cfg = victory_core::Config::load()?;
-    // `VICTORY_FRAMETIME_DUMP=1`: write beside the rest of Victory's cache.
-    if std::env::var_os("VICTORY_FRAMETIME_DUMP").is_some_and(|v| v.to_str() == Some("1")) {
-        victory_gpu::frametime::use_dump_path(cfg.cache_dir.join("frametime.csv"));
+    if execute {
+        // Before the host's own memory (the image read below, the GPU
+        // device, the caches) takes the space the title's 32-bit memory needs.
+        victory_hle::modules::xmem::low_guards::install();
     }
+    let cfg = victory_core::Config::load()?;
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
-    let label = match victory_game::identify(&hash) {
-        Some(build) => format!("{} ({hash})", build.label),
-        None => format!("unknown ({hash})"),
-    };
-    println!("build          {label}");
-    victory_gpu::frametime::use_build_label(label);
+    match victory_game::identify(&hash) {
+        Some(build) => println!("build          {} ({hash})", build.label),
+        None => println!("build          unknown ({hash})"),
+    }
 
     let images = cfg.cache_subdir("images")?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
@@ -112,6 +111,7 @@ pub fn run(
         println!("not executing (pass --execute to start the title)");
         return Ok(());
     }
+    crate::rt_off::apply(title_dir);
     victory_loader::report_crashes();
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
     victory_hle::runtime::use_console_timers();
@@ -128,9 +128,6 @@ pub fn run(
     victory_hle::runtime::set_title_dll_loader(Box::new(move |file| {
         late.load(file, show).map_err(|e| format!("{e:#}"))
     }));
-    // Before the title's watchdog runs: a slow device creation then only
-    // delays the boot.
-    victory_gpu::make_host_early();
     // SAFETY: imports are bound; from here on we run title code.
     let main = unsafe { Arc::new(image).spawn_main(dlls)? };
     let code = main

@@ -62,6 +62,8 @@ pub(crate) struct Shader {
     pub(crate) hash: String,
     container: Vec<u8>,
     #[cfg(windows)]
+    pub(crate) resolves_light: bool,
+    #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
 }
 
@@ -112,11 +114,16 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 hash: full.to_hex()[..16].to_owned(),
                 container: bytes.to_vec(),
                 #[cfg(windows)]
+                resolves_light: bytes.windows(crate::ambient::PROGRAM.len()).any(|w| w == crate::ambient::PROGRAM),
+                #[cfg(windows)]
                 translated: OnceLock::new(),
             })
         })
         .clone()
 }
+
+#[cfg(windows)]
+pub(crate) use host::depth_bounds_test;
 
 /// Puts the translation of a container of the title's into the cache on
 /// disk, and with `compute` its host pipeline into the driver's, before any
@@ -130,6 +137,7 @@ pub fn warm(stage: &'static str, container: &[u8], compute: bool) -> (bool, Opti
         stage,
         hash: full.to_hex()[..16].to_owned(),
         container: container.to_vec(),
+        resolves_light: container.windows(crate::ambient::PROGRAM.len()).any(|w| w == crate::ambient::PROGRAM),
         translated: OnceLock::new(),
     });
     let translated = shader.translated().is_some();
@@ -375,6 +383,10 @@ struct Pipeline {
     /// One of the ray-tracing structure builder's ([`Builder`]).
     #[cfg(windows)]
     builder: bool,
+    /// One with a shader of [`drop_shaders`]: never made on the host, its
+    /// draws and dispatches not run.
+    #[cfg(windows)]
+    dropped: bool,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
@@ -384,17 +396,6 @@ const GRAPHICS_STAGES: [&str; 5] = ["vertex", "pixel", "domain", "hull", "geomet
 fn pipeline<'a>(this: This) -> &'a Pipeline {
     // SAFETY: the title passes one of our pipelines.
     unsafe { &*this.cast::<Pipeline>() }
-}
-
-/// The stages and hashes of title pipeline `this`, as `[mesh 0123..,
-/// pixel 4567..]` (diagnostics); "no pipeline" for none.
-#[cfg(all(windows, feature = "diagnostics"))]
-pub(crate) fn shaders_of(this: This) -> String {
-    if this.is_null() {
-        return "no pipeline".to_owned();
-    }
-    let names: Vec<String> = pipeline(this).shaders.iter().map(|s| format!("{} {}", s.stage, s.hash)).collect();
-    format!("[{}]", names.join(", "))
 }
 
 /// List method: logs each pipeline's shaders the first time a list binds
@@ -435,8 +436,34 @@ pub(crate) fn making() -> u64 {
 #[cfg(all(windows, feature = "diagnostics"))]
 static DROPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
 
-/// Shader hashes as printed in the pipeline diagnostics.
+/// Shader hashes whose pipelines are dropped ([`drop_shaders`]).
 #[cfg(windows)]
+static DROPPED_SHADERS: OnceLock<std::collections::HashSet<String>> = OnceLock::new();
+
+/// Pipelines made with any of these shaders (16-digit hashes, the first 8
+/// bytes of the container's BLAKE3, as in the pipeline diagnostics) are not
+/// made on the host, and their draws and dispatches are not run; in every
+/// build, unlike `VICTORY_SKIP_PIPELINES`. Set once, before the title makes
+/// pipelines (the front end's `VICTORY_RT_OFF`); later sets are ignored.
+pub fn drop_shaders(hashes: std::collections::HashSet<String>) {
+    #[cfg(windows)]
+    let _ = DROPPED_SHADERS.set(hashes);
+    #[cfg(not(windows))]
+    let _ = hashes;
+}
+
+/// Pipelines made dropped ([`drop_shaders`]).
+pub static DROPPED_PIPELINES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(windows)]
+fn dropped(shaders: &[Arc<Shader>]) -> bool {
+    DROPPED_SHADERS
+        .get()
+        .is_some_and(|d| shaders.iter().any(|s| d.contains(&s.hash)))
+}
+
+/// Shader hashes as printed in the pipeline diagnostics.
+#[cfg(all(windows, feature = "diagnostics"))]
 fn parse_skip_hashes(value: &str) -> Vec<String> {
     value
         .split(',')
@@ -456,14 +483,8 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
         .collect()
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "diagnostics"))]
 fn skipped_shader(p: &Pipeline) -> Option<&str> {
-    skipped_among(&p.shaders)
-}
-
-/// The first of `shaders` that `VICTORY_SKIP_PIPELINES` names.
-#[cfg(windows)]
-pub(crate) fn skipped_among(shaders: &[Arc<Shader>]) -> Option<&str> {
     static HASHES: OnceLock<Vec<String>> = OnceLock::new();
     let hashes = HASHES.get_or_init(|| {
         let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
@@ -472,15 +493,26 @@ pub(crate) fn skipped_among(shaders: &[Arc<Shader>]) -> Option<&str> {
     if hashes.is_empty() {
         return None;
     }
-    shaders
+    p.shaders
         .iter()
         .find(|shader| hashes.contains(&shader.hash))
         .map(|shader| shader.hash.as_str())
 }
 
+/// Whether draws and dispatches of `this` are not run: dropped
+/// ([`drop_shaders`]) or, in diagnostics builds, skipped
+/// (`VICTORY_SKIP_PIPELINES`).
 #[cfg(windows)]
 pub(crate) fn is_skipped(this: This) -> bool {
-    !this.is_null() && skipped_shader(pipeline(this)).is_some()
+    if this.is_null() {
+        return false;
+    }
+    let p = pipeline(this);
+    #[cfg(feature = "diagnostics")]
+    if skipped_shader(p).is_some() {
+        return true;
+    }
+    p.dropped
 }
 
 /// Counts a draw or dispatch of `this` intentionally skipped or dropped
@@ -493,6 +525,7 @@ pub(crate) fn note_drop(this: This) {
         let p = pipeline(this);
         skipped_shader(p)
             .map(|hash| format!("skipped shader {hash}"))
+            .or_else(|| p.dropped.then(|| "ray tracing, off (VICTORY_RT_OFF)".to_owned()))
             .or_else(|| make::missing(&p.host))
     };
     if let Some(why) = why {
@@ -540,7 +573,13 @@ fn hand_out(
     #[cfg(windows)]
     let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
     #[cfg(windows)]
-    make::early(&host);
+    let dropped = dropped(&shaders);
+    #[cfg(windows)]
+    if dropped {
+        DROPPED_PIPELINES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    } else {
+        make::early(&host);
+    }
     #[cfg(windows)]
     let builder = of_builder(&shaders);
     #[cfg(windows)]
@@ -557,6 +596,8 @@ fn hand_out(
         host,
         #[cfg(windows)]
         builder,
+        #[cfg(windows)]
+        dropped,
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
     });
@@ -760,7 +801,7 @@ pub fn save_pipeline_cache() {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(windows)]
+    #[cfg(all(windows, feature = "diagnostics"))]
     #[test]
     fn skip_hashes_accepts_full_hashes_only() {
         assert!(super::parse_skip_hashes(" , ").is_empty());

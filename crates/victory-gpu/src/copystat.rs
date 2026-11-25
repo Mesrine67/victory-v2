@@ -21,6 +21,8 @@ pub(crate) enum C {
     Queries,
     QueryUs,
     MoveUs,
+    /// Bytes copied by a plain `memcpy` instead of a kernel call.
+    MoveFast,
     Unmapped,
     /// Write-watch askings and their time.
     Watches,
@@ -86,6 +88,12 @@ pub(crate) enum C {
     /// Texture uploads recorded, and left out as unchanged.
     TexUploads,
     TexSkipped,
+    /// Texture subresources detiled and their bytes, and of them the ones
+    /// detiled in bands on several threads (`texture::detile_wide`).
+    TexDetiled,
+    TexDetiledBytes,
+    TexBanded,
+    TexBandedBytes,
     /// Held submissions a present ran although their waits were not met.
     Forced,
     /// Ranges named through unordered access views by shaders that cannot
@@ -690,11 +698,6 @@ fn log_memory() {
     let card = crate::host::host()
         .and_then(|h| h.video_memory())
         .unwrap_or_default();
-    // Everything the system says of the two memory groups, beside the
-    // budget and use the lines below print.
-    if let Some(h) = crate::host::host() {
-        h.log_video_memory("with the memory line");
-    }
     // What else holds memory: the map, on a thread of its own, with every
     // sixth line; and what the shader table and the pipeline library keep.
     static LINES: AtomicU64 = AtomicU64::new(0);
@@ -1066,8 +1069,8 @@ pub(crate) fn log(frames: f64) {
     let ms = |v: f64| v / 1e3;
     tracing::info!(
         "copies per frame: {:.1} submissions; {:.0} title copies {:.1} MB; {:.0} refreshes {:.1} MB, \
-         {:.0} skipped {:.1} MB; {:.0} runs {:.1} ms; {:.0} queries {:.2} ms, moves {:.2} ms, \
-         {:.2} MB unmapped; {:.0} page faults; {:.0} watches {:.2} ms, {:.1} MB checked, {:.1} MB \
+         {:.0} skipped {:.1} MB; {:.0} runs {:.1} ms; {:.0} queries {:.2} ms, moves {:.2} ms \
+         ({:.1} MB by memcpy), {:.2} MB unmapped; {:.0} page faults; {:.0} watches {:.2} ms, {:.1} MB checked, {:.1} MB \
          unchanged; {:.1} fallbacks; {:.0} guard faults; textures {:.1} MB watched and \
          changed, {:.1} MB hashed, {:.1} MB of them changed",
         c[C::Submissions as usize],
@@ -1082,6 +1085,7 @@ pub(crate) fn log(frames: f64) {
         c[C::Queries as usize],
         ms(c[C::QueryUs as usize]),
         ms(c[C::MoveUs as usize]),
+        mb(c[C::MoveFast as usize]),
         mb(c[C::Unmapped as usize]),
         faults as f64 / frames,
         c[C::Watches as usize],
@@ -1143,7 +1147,8 @@ pub(crate) fn log(frames: f64) {
          until the first submission; {:.1} ms from the last submission to the present call; \
          lists reset in {:.1} ms; the process ran {user:.0} ms user + {kernel:.0} ms kernel on \
          all threads; what shaders wrote: {:.1} ms finding {:.0} pieces that differ, {:.1} ms \
-         putting them back; texture uploads: {:.0} recorded, {:.0} left out; {:.1} held \
+         putting them back; texture uploads: {:.0} recorded, {:.0} left out; {:.0} subresources \
+         detiled {:.1} MB, {:.0} of them in bands {:.1} MB; {:.1} held \
          submissions run at the present with their waits not met; waits for memory values: \
          {:.0} looks {:.1} ms; {:.0} host lists made {:.1} ms; {:.0} parts of held submissions \
          ran alone that the next part could have run with",
@@ -1156,6 +1161,10 @@ pub(crate) fn log(frames: f64) {
         ms(c[C::BackSyncUs as usize]),
         c[C::TexUploads as usize],
         c[C::TexSkipped as usize],
+        c[C::TexDetiled as usize],
+        c[C::TexDetiledBytes as usize] / 1e6,
+        c[C::TexBanded as usize],
+        c[C::TexBandedBytes as usize] / 1e6,
         c[C::Forced as usize],
         c[C::WaitChecks as usize],
         c[C::WaitCheckNs as usize] / 1e6,

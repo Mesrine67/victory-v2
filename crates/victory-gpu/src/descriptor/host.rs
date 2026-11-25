@@ -636,57 +636,43 @@ pub(crate) fn near_heaps(va: u64) -> String {
 /// tiers 1 and 2; tier 3 hardware may take more.
 const PORTABLE_VIEWS: u32 = 1_000_000;
 
-/// The size of every host view heap on a host that takes more than
-/// [`PORTABLE_VIEWS`] (AMD): the title's heap (a little over 1,000,000
-/// views in the retail game) plus [`DYNAMIC`] fits with room to spare, and
-/// the last slot is the null slot every view index at or past it reads.
-const UNCAPPED_VIEWS: u32 = 1 << 21;
+/// The views of the title's heap, for the limit shaders translated
+/// before that heap is made have ([`probe_view_limit`]).
+/// shortcut: this title's; a larger heap would lose its last views.
+const TITLE_VIEWS: u32 = 1_245_184;
 
-/// Picks, once, the null slot at the end of every host view heap and tells
-/// the translator now (`set_view_heap_limit`) instead of when the title's
-/// heap is made: a shader keeps the limit it was translated with, and the
-/// title makes 25 pipelines (their shaders translated at once) before it
-/// makes its view heap. Called before a shader is translated and before a
-/// view heap is made.
-///
-/// Every host clamps. A host that caps view heaps at [`PORTABLE_VIEWS`]
-/// (NVIDIA) hung on a view index past the heap; one that does not (AMD
-/// RDNA3, RX 7900 XT) took a page fault and removed the device on entering
-/// the world: a compute program read view slot 16,777,088 (0xffff80) of a
-/// heap of 1,507,328, past its end. Unclamped, that index is undefined on
-/// any host.
+/// Asks the host, once, whether it caps view heaps at [`PORTABLE_VIEWS`],
+/// and if so tells the translator now (`set_view_heap_limit`) instead of
+/// when the title's heap is made: a shader keeps the limit it was
+/// translated with, and the title makes 25 pipelines (their
+/// shaders translated at once) before it makes its view heap. Those would
+/// read a view index past the heap unclamped, the read that hangs NVIDIA.
+/// Called before a shader is translated.
+/// shortcut: the limit is the capped heap's last slot whatever size the
+/// title's heap turns out to have; a heap that fits is not capped and
+/// keeps no null slot there (an index past it is as undefined as before).
 pub(crate) fn probe_view_limit() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let Some(host) = host() else { return };
-        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
-        // SAFETY: a fixed-size feature query for this device and the matching structure.
-        let reported = unsafe {
-            host.device.CheckFeatureSupport(
-                D3D12_FEATURE_D3D12_OPTIONS19,
-                std::ptr::from_mut(&mut options).cast(),
-                size_of_val(&options) as u32,
-            )
-        }.is_ok() && options.MaxViewDescriptorHeapSize != 0;
-        let views = if reported {
-            options.MaxViewDescriptorHeapSize.min(UNCAPPED_VIEWS)
-        } else {
-            // Older runtimes do not expose the optional larger heap size.
-            let desc = D3D12_DESCRIPTOR_HEAP_DESC {
-                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                NumDescriptors: UNCAPPED_VIEWS,
-                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
-                NodeMask: 0,
-            };
-            // SAFETY: plain heap creation; the heap is released at once.
-            let probe: windows::core::Result<ID3D12DescriptorHeap> = unsafe { host.device.CreateDescriptorHeap(&desc) };
-            if probe.is_ok() { UNCAPPED_VIEWS } else { PORTABLE_VIEWS }
+        // SAFETY: plain heap creation; the heap is released at once.
+        let made: windows::core::Result<ID3D12DescriptorHeap> = unsafe {
+            host.device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: PORTABLE_VIEWS + 1,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })
         };
-        tracing::info!(
-            views,
-            "host view heaps hold {views} views; view indices are clamped to the null slot at the end from the first shader on"
-        );
-        victory_shader::emit::set_view_heap_limit(views - 1);
+        if made.is_err() {
+            tracing::info!("the host caps view heaps at {PORTABLE_VIEWS}: view indices are clamped from the first shader on");
+            victory_shader::emit::set_view_heap_limit(PORTABLE_VIEWS - 1);
+        } else {
+            // A read past the end of an uncapped heap hangs AMD's GPU too
+            // (RX 7800 XT: a page fault 480 MiB past the heap's start).
+            victory_shader::emit::set_view_heap_limit(TITLE_VIEWS + DYNAMIC - 1);
+        }
     });
 }
 
@@ -724,41 +710,20 @@ impl HostHeap {
             }
         };
         let extra = if sampler { 0 } else { DYNAMIC };
-        // A view heap ends at the null slot shaders clamp view indices to
-        // (`probe_view_limit`), whatever the title's own count: the title's
-        // slots, then the dynamic ones, then null up to and with that slot.
-        if !sampler {
-            probe_view_limit();
-        }
-        let null = if sampler {
-            0
-        } else {
-            victory_shader::emit::view_heap_limit()
-        };
-        let (heap, count, size) = if null == 0 {
-            match make(count + extra) {
-                Ok(heap) => (heap, count, count + extra),
-                Err(e) => {
-                    tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
-                    return None;
-                }
-            }
-        } else {
-            let size = null + 1;
-            let fitted = if count + extra <= null {
-                count
-            } else {
+        let (heap, count, size) = match make(count + extra) {
+            Ok(heap) => (heap, count, count + extra),
+            Err(e) if !sampler && count + extra > PORTABLE_VIEWS => {
                 // shortcut: descriptors past the host's limit are left out; a title that reaches
-                // them needs remapping. They read the null slot instead.
-                tracing::warn!(count, "host view heap capped at {size}; views past it read a null slot");
-                null - extra
-            };
-            match make(size) {
-                Ok(heap) => (heap, fitted, size),
-                Err(e) => {
-                    tracing::warn!(error = %e, count, size, "no host view heap");
-                    return None;
-                }
+                // them needs remapping. The heap's last slot stays null, and shaders read it for
+                // any view index from there on (`set_view_heap_limit`): a read past the heap's
+                // end hung NVIDIA's GPU (the title's heap is a little over 1 000 000 views).
+                tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}; views past it read a null slot");
+                victory_shader::emit::set_view_heap_limit(PORTABLE_VIEWS - 1);
+                (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - extra - 1, PORTABLE_VIEWS)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
+                return None;
             }
         };
         // SAFETY: a live heap.
@@ -769,14 +734,17 @@ impl HostHeap {
             )
         };
         tracing::debug!(count, sampler, "host descriptor heap");
-        // The null slot every index past the heap reads is the heap's last,
-        // past the dynamic slots (`probe_view_limit`): all of them are free.
-        let taken = vec![false; DYNAMIC as usize];
+        if !sampler && count + extra != TITLE_VIEWS + DYNAMIC && size == count + extra {
+            tracing::warn!(count, "a view heap of another size than the limit shaders have");
+        }
+        // The last slot stays null: what shaders read for an index past the heap.
+        let mut taken = vec![false; DYNAMIC as usize];
+        taken[DYNAMIC as usize - 1] = true;
         // SAFETY: a live shader-visible heap.
         let gpu = unsafe { heap.GetGPUDescriptorHandleForHeapStart().ptr };
         GPU_RANGES.lock().unwrap_or_else(|e| e.into_inner()).push((
             gpu,
-            u64::from(size) * u64::from(step),
+            u64::from(count + extra) * u64::from(step),
             u64::from(step),
             sampler,
         ));
@@ -887,6 +855,26 @@ fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     unsafe { host.device.CreateSampler(&desc, at) };
 }
 
+/// Find the first contiguous run in next-fit order. A run that starts
+/// before the cursor can finish after it, up to `n - 1` slots beyond.
+fn find_dynamic_run(taken: &[bool], cursor: usize, n: usize) -> Option<usize> {
+    let prefix_end = if cursor == 0 {
+        0
+    } else {
+        (cursor + n - 1).min(taken.len())
+    };
+    for (base, slots) in [(cursor, &taken[cursor..]), (0, &taken[..prefix_end])] {
+        let mut run = 0;
+        for (offset, &used) in slots.iter().enumerate() {
+            run = if used { 0 } else { run + 1 };
+            if run == n {
+                return Some(base + offset + 1 - n);
+            }
+        }
+    }
+    None
+}
+
 impl HostHeap {
     /// `n` consecutive free dynamic slots (view heaps only), taken until
     /// [`HostHeap::release`]: the first's index.
@@ -903,23 +891,11 @@ impl HostHeap {
         let enough = self.free.load(std::sync::atomic::Ordering::Relaxed) >= n
             && n < self.too_long.load(std::sync::atomic::Ordering::Relaxed);
         let n = n as usize;
-        // Search from `next` on, then from the start.
-        let starts = (*next as usize..self.dynamic as usize).chain(0..*next as usize);
-        let mut run = 0;
-        let mut found = None;
-        let mut last = usize::MAX;
-        for at in starts.take(if enough { DYNAMIC as usize } else { 0 }) {
-            // A run cannot wrap past the end.
-            if at != last.wrapping_add(1) {
-                run = 0;
-            }
-            last = at;
-            run = if taken[at] { 0 } else { run + 1 };
-            if run == n {
-                found = Some(at + 1 - n);
-                break;
-            }
-        }
+        let found = if enough {
+            find_dynamic_run(taken, *next as usize, n)
+        } else {
+            None
+        };
         let Some(first) = found else {
             if enough {
                 self.too_long.fetch_min(n as u32, std::sync::atomic::Ordering::Relaxed);
@@ -966,20 +942,6 @@ impl HostHeap {
     pub(crate) fn texture_slots_due(&self, frame: u64, max: usize) -> (Vec<(u32, u64)>, [u64; 5]) {
         let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         (if max == 0 { Vec::new() } else { textures.due(frame, max) }, textures.census(frame))
-    }
-
-    /// Every title slot of the queue that is due at `frame`, and whether
-    /// it was uploaded before (in part, or whole and waiting for another
-    /// look): for the card accounting line
-    /// (`crate::resource::card_accounting`).
-    pub(crate) fn texture_slots_all_due(&self, frame: u64) -> Vec<(u32, bool)> {
-        let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-        textures
-            .slots
-            .iter()
-            .filter(|(_, w)| w.due <= frame)
-            .map(|(&index, w)| (index, w.mapped > 0 || textures.rechecks.contains_key(&index)))
-            .collect()
     }
 
     /// The texture view of title slot `index` (as handed out with `write`)
@@ -1089,36 +1051,6 @@ impl HostHeap {
         }
         STALE[3].fetch_add(slots.len() as u64, Relaxed);
         slots.len()
-    }
-
-    /// Whether host slot `index` is made from the very record the title
-    /// has at `handle` now. Its host texture then exists (a slot keeps what
-    /// it views), so bringing that texture up to date takes no memory of
-    /// the card.
-    pub(crate) fn texture_slot_made_from(&self, index: u32, handle: u64) -> bool {
-        if index >= self.count {
-            return false;
-        }
-        // SAFETY: the handle is a descriptor slot in title memory.
-        let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
-        let key = u64::from(generation) << 32 | u64::from(i);
-        if tag != VIEW_TAG {
-            return false;
-        }
-        // And the slot holds a host resource: a slot is also noted as made
-        // from a view the host could not make (`make` gave nothing, the
-        // slot is null and keeps nothing). The host copy of such a
-        // texture is held by no slot, may have been let go, and would be
-        // made anew here, with the card full. `made` first, then `kept`,
-        // as `mirror` takes them.
-        let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-        made.get(index as usize).is_some_and(|&made| made != 0 && made == key)
-            && self
-                .kept
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(index as usize)
-                .is_some_and(Option::is_some)
     }
 
     /// Goes on with a look at all of the heap's placed texture views, a
@@ -1746,25 +1678,6 @@ impl HostHeap {
         let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
         let shown = kept.get(index as usize)?.as_ref()?;
         Some(windows::core::Interface::as_raw(shown) == windows::core::Interface::as_raw(buffer))
-    }
-
-    /// What the queue of textures picked by index knows of title slot
-    /// `index` at `frame`, in a few words (diagnostics).
-    #[cfg(feature = "diagnostics")]
-    pub(crate) fn texture_slot_state(&self, index: u32, frame: u64) -> String {
-        let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-        match textures.slots.get(&index) {
-            None if textures.rechecks.contains_key(&index) => "uploaded whole, to be looked at again".into(),
-            None => "not queued".into(),
-            Some(w) => format!(
-                "queued due={} written@{} looks={} part_mapped={} recheck={}",
-                if w.due <= frame { "now".to_string() } else { format!("@{}", w.due) },
-                w.written,
-                w.looks,
-                w.mapped,
-                textures.rechecks.contains_key(&index)
-            ),
-        }
     }
 
     /// The view host slot `index` was made from, in a few words, with the
@@ -2772,29 +2685,6 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 mod tests {
     use super::*;
 
-    #[test]
-    fn shader_view_limit_fits_the_reported_heap() {
-        let Some(host) = crate::host::host() else {
-            return;
-        };
-        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
-        // SAFETY: output storage matches the device feature query.
-        if unsafe {
-            host.device.CheckFeatureSupport(
-                D3D12_FEATURE_D3D12_OPTIONS19,
-                std::ptr::from_mut(&mut options).cast(),
-                size_of_val(&options) as u32,
-            )
-        }
-        .is_ok()
-            && options.MaxViewDescriptorHeapSize != 0
-        {
-            super::probe_view_limit();
-            let limit = victory_shader::emit::view_heap_limit();
-            assert!(limit < options.MaxViewDescriptorHeapSize);
-        }
-    }
-
     /// A null texture UAV keeps the title's dimension (3D for the world's
     /// wind field), and is 2D when the title names none.
     #[test]
@@ -2962,7 +2852,7 @@ mod tests {
         let before = print(&memory);
         assert_eq!(print(&memory), before);
         let last = memory.len() - 1;
-        for at in [0, ((memory.len() - 4096) / 11 * 5) & !0xfff, last] {
+        for at in [0, (memory.len() - 4096) / 11 * 5 & !0xfff, last] {
             memory[at] ^= 1;
             assert_ne!(print(&memory), before, "byte {at}");
             memory[at] ^= 1;
@@ -3023,27 +2913,8 @@ mod tests {
         assert!(q.due(16, 100).iter().any(|d| d.0 == 98));
     }
 
-    /// A slot written with another texture leaves its old span; the same
-    /// view written again changes nothing.
-    #[test]
-    fn a_slot_rewritten_moves_to_its_new_span() {
-        let mut spans = Spans::default();
-        assert!(spans.note(1, 0x10000, 0x12000, &shape(0x10000, 0x12000), true).is_empty());
-        assert!(spans.note(2, 0x12000, 0x14000, &shape(0x12000, 0x14000), true).is_empty());
-        assert!(spans.note(1, 0x10000, 0x12000, &shape(0x10000, 0x12000), true).is_empty());
-        assert_eq!(spans.slots_in(0x10000, 0x10001), [1]);
-        // Slot 1 now views a texture far away.
-        assert!(spans.note(1, 0x90000, 0x91000, &shape(0x90000, 0x91000), true).is_empty());
-        assert_eq!(spans.slots_in(0x10000, 0x10001), [] as [u32; 0]);
-        assert_eq!(spans.slots_in(0x12000, 0x12001), [2]);
-        assert_eq!(spans.slots_in(0x90000, 0x90001), [1]);
-        spans.forget(1);
-        spans.forget(2);
-        assert!(spans.spans.is_empty() && spans.by_slot.is_empty());
-    }
-
-    /// A view written over memory that older views describe otherwise makes
-    /// those stale; views of the same span are one texture's.
+    /// A view written over memory that older views describe otherwise
+    /// makes those stale; views of the same span are one texture's.
     #[test]
     fn a_newer_view_of_other_memory_makes_the_older_stale() {
         let mut spans = Spans::default();

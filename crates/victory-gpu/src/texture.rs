@@ -34,6 +34,8 @@ macro_rules! once {
 /// texture's subresources, and what was last detiled.
 pub(crate) struct Staging {
     buffer: ID3D12Resource,
+    /// Size when pooled (`VICTORY_STAGING_POOL`); 0 if not pooled.
+    pooled: u64,
     /// Its bytes.
     #[cfg(feature = "diagnostics")]
     total: u64,
@@ -74,6 +76,10 @@ struct Last {
     /// ([`Staging::unseen_write`]): it is hashed at every check until this
     /// frame.
     unguarded: u64,
+    /// True once `watch::writes(..., false)` confirmed this texture is not in
+    /// write-watched private memory (e.g. view memory), avoiding a failing
+    /// `GetWriteWatch` syscall under `JOURNAL` on every refresh.
+    unwatched: bool,
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -83,6 +89,37 @@ unsafe impl Send for Staging {}
 unsafe impl Sync for Staging {}
 
 static STAGING: Mutex<Option<HashMap<usize, Arc<Staging>>>> = Mutex::new(None);
+
+struct Spare(ID3D12Resource, usize);
+unsafe impl Send for Spare {}
+
+/// (total cap = 256 MiB, max single buffer = 8 MiB).
+const SPARE_MOST: (u64, u64) = (256 << 20, 8 << 20);
+static SPARE: Mutex<(std::collections::BTreeMap<u64, Vec<Spare>>, u64)> =
+    Mutex::new((std::collections::BTreeMap::new(), 0));
+
+fn staging_buffer(host: &crate::host::Host, total: u64) -> Option<(ID3D12Resource, *mut u8, u64)> {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let size = total.max(64 << 10).next_power_of_two();
+    if size > SPARE_MOST.1
+        || !*ON.get_or_init(|| std::env::var_os("VICTORY_STAGING_POOL").is_none_or(|v| v != "0"))
+    {
+        return host.upload_buffer(total).map(|(buffer, data)| (buffer, data, 0));
+    }
+    let spare = {
+        let mut all = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        let taken = all.0.get_mut(&size).and_then(Vec::pop);
+        if taken.is_some() {
+            all.1 -= size;
+        }
+        taken
+    };
+    if let Some(Spare(buffer, data)) = spare {
+        unsafe { std::ptr::write_bytes(data as *mut u8, 0, total as usize) };
+        return Some((buffer, data as *mut u8, size));
+    }
+    host.upload_buffer(size).map(|(buffer, data)| (buffer, data, size))
+}
 
 /// The buffer a texture the host writes is copied through into the texture
 /// of a view the title placed in its memory in another format
@@ -311,7 +348,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
 /// is remapping may show a frame later. It never shows partly read.
 fn no_wait() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_NO_WAIT").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_NO_WAIT").is_none_or(|v| v != "0"))
 }
 
 /// Since the last frame-rate line, with [`no_wait`]: refreshes that read
@@ -395,6 +432,16 @@ impl Drop for Staging {
         use std::sync::atomic::Ordering::Relaxed;
         STAGED[0].fetch_sub(1, Relaxed);
         STAGED[1].fetch_sub(self.bytes, Relaxed);
+        if self.pooled > 0 {
+            let mut all = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+            if all.1 + self.pooled <= SPARE_MOST.0 {
+                all.0
+                    .entry(self.pooled)
+                    .or_default()
+                    .push(Spare(self.buffer.clone(), self.data as usize));
+                all.1 += self.pooled;
+            }
+        }
     }
 }
 
@@ -430,22 +477,19 @@ pub(crate) fn let_go() -> [u64; 2] {
 /// Called before a submission starts, by the thread that submits.
 pub(crate) fn let_go_idle() {
     use std::sync::atomic::Ordering::Relaxed;
+    const IDLE_MS: u64 = 10_000;
     const IDLE_FRAMES: u64 = 4;
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     let Some(map) = map.as_mut() else {
         return;
     };
-    if map.is_empty() {
-        return;
-    }
-    let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
     // A list that recorded an upload or a check holds the staging until it
     // is reset: one only the table holds is named by no list, recorded or
     // running.
     let (mut went, mut bytes) = (0u64, 0u64);
     map.retain(|_, s| {
         let keep = Arc::strong_count(s) > 1
-            || !crate::host::long_ago(s.used.load(Relaxed), idle_ms, IDLE_FRAMES);
+            || !crate::host::long_ago(s.used.load(Relaxed), IDLE_MS, IDLE_FRAMES);
         if !keep {
             LET_GO[0].fetch_add(1, Relaxed);
             LET_GO[1].fetch_add(s.bytes, Relaxed);
@@ -710,20 +754,23 @@ impl Staging {
         let start = self.memory as usize;
         let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
         let last = &mut *last;
-        if let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false)) {
-            if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
-                return 0;
+        if !last.unwatched {
+            if let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false)) {
+                if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
+                    return 0;
+                }
+                last.asked = now;
+                // Read through the copy, which stands unmapped pages: memory of
+                // big pools is too slow to ask page by page.
+                with_read(size, |read| {
+                    crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
+                    self.detile(read);
+                });
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
+                return size;
             }
-            last.asked = now;
-            // Read through the copy, which stands unmapped pages: memory of
-            // big pools is too slow to ask page by page.
-            with_read(size, |read| {
-                crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
-                self.detile(read);
-            });
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
-            return size;
+            last.unwatched = true;
         }
         // View memory has no write-watch, and a texture there was hashed
         // whole at every check: 229 MB and 51 ms a frame in a gameplay view
@@ -748,7 +795,7 @@ impl Staging {
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
             let frame = crate::frame::current();
-            let turn = frame.wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
+            let turn = frame.wrapping_add((start >> 16) as u64) % HASH_EVERY == 0;
             // Linear pictures of one level are what the processor draws (the
             // planes of a movie), through a view of its own.
             let desc = &self.layout.desc;
@@ -810,7 +857,7 @@ impl Staging {
             let _ = changed;
             return size;
         }
-        if through_copy() {
+        if through_copy() || crate::plaincopy::on() {
             return with_title(self.memory, size, |tiled| {
                 let hash = blake3::hash(tiled);
                 #[cfg(feature = "diagnostics")]
@@ -927,14 +974,81 @@ impl Staging {
             let linear = unsafe {
                 std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
             };
-            if let Err(e) =
-                self.layout
-                    .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
-            {
+            if let Err(e) = detile_wide(&self.layout, tiled, mip, slice, linear, pitch, rows) {
                 tracing::warn!(?e, mip, slice, "texture not detiled");
                 return;
             }
         }
+    }
+}
+
+/// A subresource of at least this many bytes is detiled in bands on the
+/// kept threads ([`crate::shadow::wide_run`]): one thread detiles some
+/// 4.5 GB/s, and a 33-67 MB texture went 1.7-2 times as fast on four
+/// (`victory-formats`' `detile_threads` benchmark).
+const BAND_BYTES: usize = 4 << 20;
+
+/// [`Layout::detile`](victory_formats::texture::Layout::detile) of one
+/// subresource into `linear` (`rows` rows `pitch` bytes apart, depth slices
+/// `pitch * rows` apart); a big one of one slice deep is cut into bands of
+/// rows detiled on several threads.
+fn detile_wide(
+    layout: &victory_formats::texture::Layout,
+    tiled: &[u8],
+    mip: u32,
+    slice: u32,
+    linear: &mut [u8],
+    pitch: usize,
+    rows: u32,
+) -> Result<(), victory_formats::texture::Error> {
+    let height = layout.mips.get(mip as usize).map_or(0, |m| m.height);
+    let deep = layout.subresource_depth(mip) != 1;
+    #[cfg(feature = "diagnostics")]
+    {
+        crate::copystat::add(crate::copystat::C::TexDetiled, 1);
+        crate::copystat::add(crate::copystat::C::TexDetiledBytes, linear.len() as u64);
+    }
+    if deep || linear.len() < 2 * BAND_BYTES || pitch == 0 || height < 2 || height > rows {
+        return layout.detile(tiled, mip, slice, linear, pitch, pitch * rows as usize);
+    }
+    #[cfg(feature = "diagnostics")]
+    {
+        crate::copystat::add(crate::copystat::C::TexBanded, 1);
+        crate::copystat::add(crate::copystat::C::TexBandedBytes, linear.len() as u64);
+    }
+    let band = (BAND_BYTES / pitch).clamp(1, height as usize) as u32;
+    let failed = std::sync::Arc::new(Mutex::new(None));
+    let (tiled_at, tiled_len) = (tiled.as_ptr() as usize, tiled.len());
+    let layout_at = std::ptr::from_ref(layout) as usize;
+    let jobs: Vec<Box<dyn FnOnce() + Send>> = linear[..height as usize * pitch]
+        .chunks_mut(band as usize * pitch)
+        .enumerate()
+        .map(|(k, part)| {
+            let y = k as u32 * band;
+            let rows = y..(y + band).min(height);
+            let (part_at, part_len) = (part.as_mut_ptr() as usize, part.len());
+            let failed = failed.clone();
+            Box::new(move || {
+                // SAFETY: `wide_run` returns only when every job has run,
+                // while the caller's borrows of the layout and both buffers
+                // last; the bands are disjoint parts of `linear`.
+                let (layout, tiled, part) = unsafe {
+                    (
+                        &*(layout_at as *const victory_formats::texture::Layout),
+                        std::slice::from_raw_parts(tiled_at as *const u8, tiled_len),
+                        std::slice::from_raw_parts_mut(part_at as *mut u8, part_len),
+                    )
+                };
+                if let Err(e) = layout.detile_rows(tiled, mip, slice, part, pitch, rows) {
+                    *failed.lock().unwrap_or_else(|e| e.into_inner()) = Some(e);
+                }
+            }) as Box<dyn FnOnce() + Send>
+        })
+        .collect();
+    crate::shadow::wide_run(jobs);
+    match failed.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        Some(e) => Err(e),
+        None => Ok(()),
     }
 }
 
@@ -971,11 +1085,10 @@ pub(crate) fn staged_memory(resource: This) -> Option<(u64, u64)> {
     Some((at as u64, len as u64))
 }
 
-/// A fingerprint of the title memory `[at, at + len)`, never 0: of all of
-/// it up to 48 KiB, else of twelve pieces of 4 KiB spread evenly over it,
-/// the first and the last included. Read through the kernel, so pages not
-/// there count as zeros. (A texture whose change falls between the pieces
-/// is missed.)
+/// A fingerprint of the title memory `[at, at + len)`: of all of it up to
+/// 48 KiB, else of twelve pieces of 4 KiB spread evenly over it, the first
+/// and the last included. Read through the kernel, so pages not there count
+/// as zeros. (A texture whose change falls between the pieces is missed.)
 pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
     const PIECE: usize = 4 << 10;
     const PIECES: usize = 12;
@@ -1003,23 +1116,12 @@ pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
         let hash = hasher.finalize();
         let mut first = [0u8; 8];
         first.copy_from_slice(&hash.as_bytes()[..8]);
-        // 0 says "none" to the texture queue (`Recheck`, `checked`).
-        u64::from_le_bytes(first) | 1
+        u64::from_le_bytes(first)
     })
 }
 
 /// Whether a title texture has a staging buffer: a list recorded its
 /// upload, and the lists that sample it check it at submission.
-/// For the frame listing: whether a list has uploaded `resource`'s staging
-/// buffer, and whether it was detiled since. None: it has none.
-#[cfg(feature = "diagnostics")]
-pub(crate) fn staged_state(resource: This) -> Option<(bool, bool)> {
-    use std::sync::atomic::Ordering::Relaxed;
-    let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    let staging = map.as_ref()?.get(&(resource as usize))?;
-    Some((staging.uploaded.load(Relaxed), staging.dirty.load(Relaxed)))
-}
-
 pub(crate) fn is_staged(resource: This) -> bool {
     let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     map.as_ref().is_some_and(|map| map.contains_key(&(resource as usize)))
@@ -1196,16 +1298,6 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
     there
 }
 
-/// The first mip a staging buffer holds and the bytes of title memory read
-/// for it and the smaller ones, for a texture of `mips` mips a view shows
-/// from `first` on: from `first` only where the layout can end behind the
-/// smaller mips (one 2-D slice: `bytes_from` is the whole layout for any
-/// other), else all of it.
-fn staged_part(layout: &victory_formats::texture::Layout, mips: u32, first: u32) -> (u32, usize) {
-    let first = if first < mips && layout.bytes_from(first) < layout.size { first } else { 0 };
-    (first, layout.bytes_from(first) as usize)
-}
-
 /// The staging state of a title texture from mip `first` on, made on first
 /// use (and made anew for larger mips than the one there holds).
 fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<Staging>> {
@@ -1232,7 +1324,13 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
     let host = host()?;
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
-    let (first, size) = staged_part(&layout, u32::from(d.MipLevels), first);
+    // Only where the title's layout can end behind the smaller mips.
+    let first = if first < u32::from(d.MipLevels) && layout.bytes_from(first) < layout.size {
+        first
+    } else {
+        0
+    };
+    let size = layout.bytes_from(first) as usize;
     let count = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
         u32::from(d.MipLevels)
     } else {
@@ -1254,7 +1352,7 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
             Some(&mut total),
         );
     }
-    let (buffer, data) = host.upload_buffer(total)?;
+    let (buffer, data, pooled) = staging_buffer(host, total)?;
     crate::host::name(&buffer, || {
         format!(
             "staging of {resource:?} {}x{}x{} f{}",
@@ -1266,6 +1364,7 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
     STAGED[1].fetch_add(total, std::sync::atomic::Ordering::Relaxed);
     let s = Arc::new(Staging {
         buffer,
+        pooled,
         #[cfg(feature = "diagnostics")]
         total,
         data,
@@ -1284,47 +1383,6 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
     });
     map.insert(resource as usize, s.clone());
     Some(s)
-}
-
-#[cfg(test)]
-mod first_mip_tests {
-    use victory_formats::texture::{Dimension, Swizzle, Texture, TextureDesc};
-
-    fn layout(depth_or_array: u32) -> victory_formats::texture::Layout {
-        let desc = TextureDesc {
-            dimension: Dimension::Tex2d,
-            width: 1024,
-            height: 1024,
-            depth_or_array,
-            mips: 9,
-            format: 71,
-            samples: 1,
-            swizzle: Swizzle::SW_4KB_S,
-        };
-        Texture::new(&desc).unwrap().planes[0].layout.clone()
-    }
-
-    /// A view from mip 4 of a 1024x1024 BC1 texture of 9 mips stages mips
-    /// 4 to 8 and reads only the memory they take; a view of all of it, an
-    /// array's view, or a first mip past the chain stage all of it.
-    #[test]
-    fn a_view_of_the_smaller_mips_stages_only_their_memory() {
-        let l = layout(1);
-        assert_eq!(super::staged_part(&l, 9, 4), (4, l.bytes_from(4) as usize));
-        assert!(l.bytes_from(4) < l.size);
-        assert_eq!(super::staged_part(&l, 9, 0), (0, l.size as usize));
-        assert_eq!(super::staged_part(&l, 9, 9), (0, l.size as usize), "past the chain");
-        let array = layout(2);
-        assert_eq!(super::staged_part(&array, 9, 4), (0, array.size as usize), "slices each hold their chain");
-    }
-
-    /// A 2-D view's first mip is its fifth word; other views show all mips.
-    #[test]
-    fn a_2d_view_names_its_first_mip() {
-        assert_eq!(crate::resource::first_mip(&[71, 4, 0x1688, 0, 4, 5, 0, 0, 0, 0]), 4);
-        assert_eq!(crate::resource::first_mip(&[71, 5, 0x1688, 0, 4, 5, 0, 0, 0, 0]), 0, "an array view");
-        assert_eq!(crate::resource::first_mip(&[71, 4, 0x1688, 0, 99, 5, 0, 0, 0, 0]), 15);
-    }
 }
 
 #[cfg(test)]
@@ -1434,6 +1492,110 @@ mod title_memory_tests {
                     .expect("the staging buffer's bytes are enough");
                 assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod detile_tests {
+    use super::{BAND_BYTES, detile_wide};
+    use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
+
+    /// Big subresources detiled in bands on several threads, and small ones
+    /// whole, give the rows of one whole detile, also with padded rows and
+    /// in the mips of a big texture.
+    #[test]
+    fn a_texture_detiled_in_bands_is_the_one_detiled_whole() {
+        let desc = |w, h, mips, bpe, block, swizzle| Desc {
+            dimension: Dimension::Tex2d,
+            width: w,
+            height: h,
+            depth: 1,
+            mips,
+            element_bytes: bpe,
+            block,
+            samples: 1,
+            swizzle,
+        };
+        for d in [
+            desc(2048, 1500, 3, 4, 1, Swizzle::SW_64KB_S),
+            desc(4096, 4096, 2, 16, 4, Swizzle::SW_64KB_D),
+            desc(1030, 2051, 1, 8, 1, Swizzle::SW_4KB_S),
+            desc(256, 256, 1, 4, 1, Swizzle::SW_4KB_S),
+        ] {
+            let l = Layout::new(&d).unwrap();
+            let tiled: Vec<u8> = (0..l.size as usize)
+                .map(|i| (i * 7 + i / 4093) as u8)
+                .collect();
+            for mip in 0..d.mips {
+                let m = &l.mips[mip as usize];
+                let pitch = (m.width as usize * d.element_bytes as usize).next_multiple_of(256);
+                let rows = m.height;
+                let size = pitch * rows as usize;
+                let mut whole = vec![0u8; size];
+                l.detile(&tiled, mip, 0, &mut whole, pitch, size).unwrap();
+                let mut banded = vec![0xA5u8; size];
+                detile_wide(&l, &tiled, mip, 0, &mut banded, pitch, rows).unwrap();
+                // Row padding is not written by either: compare the rows.
+                let bytes = m.width as usize * d.element_bytes as usize;
+                for y in 0..rows as usize {
+                    assert_eq!(
+                        banded[y * pitch..][..bytes],
+                        whole[y * pitch..][..bytes],
+                        "{d:?} mip {mip} row {y} ({} bands)",
+                        size.div_ceil(BAND_BYTES)
+                    );
+                }
+            }
+        }
+    }
+
+    /// The detile of a submission's big texture whole on one thread and in
+    /// bands on the kept threads (a benchmark: `cargo test --release -p
+    /// victory-gpu detile_in_bands -- --ignored --nocapture`).
+    #[test]
+    #[ignore = "benchmark"]
+    fn detile_in_bands() {
+        for (w, h, bpe, swizzle) in [
+            (3840u32, 2160u32, 4u32, Swizzle::SW_4KB_S),
+            (4096, 4096, 4, Swizzle::SW_64KB_S),
+            (2048, 2048, 16, Swizzle::SW_64KB_D),
+            (1024, 1024, 4, Swizzle::SW_64KB_S),
+        ] {
+            let d = Desc {
+                dimension: Dimension::Tex2d,
+                width: w,
+                height: h,
+                depth: 1,
+                mips: 1,
+                element_bytes: bpe,
+                block: 1,
+                samples: 1,
+                swizzle,
+            };
+            let l = Layout::new(&d).unwrap();
+            let tiled: Vec<u8> = (0..l.size as usize).map(|i| i as u8).collect();
+            let pitch = (w * bpe) as usize;
+            let size = pitch * h as usize;
+            let mut linear = vec![0u8; size];
+            let mut fastest = |f: &mut dyn FnMut(&mut [u8])| {
+                (0..7)
+                    .map(|_| {
+                        let started = std::time::Instant::now();
+                        f(&mut linear);
+                        started.elapsed().as_secs_f64()
+                    })
+                    .fold(f64::INFINITY, f64::min)
+            };
+            let one = fastest(&mut |out| l.detile(&tiled, 0, 0, out, pitch, size).unwrap());
+            let bands = fastest(&mut |out| detile_wide(&l, &tiled, 0, 0, out, pitch, h).unwrap());
+            println!(
+                "{w}x{h} {bpe} B {swizzle:?}, {:.1} MB: whole {:.2} ms, in bands {:.2} ms ({:.2}x)",
+                size as f64 / 1e6,
+                one * 1e3,
+                bands * 1e3,
+                one / bands
+            );
         }
     }
 }

@@ -52,10 +52,6 @@ fn build() -> &'static [u8; 32] {
                 "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
             );
         }
-        // The view heap's null slot is part of the translation (it differs
-        // by host GPU): found before it goes into the key, so a translation
-        // cached without the clamp is never served.
-        crate::descriptor::host::probe_view_limit();
         let mut hash = blake3::Hasher::new();
         for source in victory_shader::sources().iter().copied().chain([include_str!("shader_cache.rs")]) {
             hash.update(&(source.len() as u64).to_le_bytes());
@@ -95,21 +91,6 @@ fn build() -> &'static [u8; 32] {
         }
         *hash.finalize().as_bytes()
     })
-}
-
-/// Warm-up before a run (`victory translate --warm`): `container`
-/// translated into the cache as a run would, so the run finds it there.
-/// The host device is made first: the translation follows its widest wave
-/// and its view heap limit, as in a run. `Ok(true)` when it was translated
-/// now, `Ok(false)` when the cache had it.
-pub fn warm(container: &[u8]) -> Result<bool, String> {
-    if crate::host::host().is_none() {
-        return Err("no host device".into());
-    }
-    crate::descriptor::host::probe_view_limit();
-    let before = MISSES.load(Ordering::Relaxed);
-    host_shader(container)?;
-    Ok(MISSES.load(Ordering::Relaxed) > before)
 }
 
 /// The translation of a console shader container, from the cache when

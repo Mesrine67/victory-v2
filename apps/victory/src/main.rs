@@ -5,6 +5,7 @@
 
 mod census;
 mod inspect;
+mod rt_off;
 mod run;
 mod shader;
 mod translate;
@@ -84,10 +85,6 @@ enum Command {
         /// Worker threads (default: every logical core).
         #[arg(long)]
         jobs: Option<usize>,
-        /// Translate every shader into the cache a run reads, as the run
-        /// would (on this PC's GPU), so the run finds them translated.
-        #[arg(long)]
-        warm: bool,
     },
     /// Translate the shaders of a title's archives into the cache and make
     /// their compute pipelines, so that a run finds them there.
@@ -167,7 +164,6 @@ fn main() -> Result<()> {
             pipelines,
             list,
             jobs,
-            warm,
         } => {
             // `VICTORY_VIEW_LIMIT=<null slot>`: translate as on a host whose view heap is capped
             if let Some(n) = std::env::var("VICTORY_VIEW_LIMIT").ok().and_then(|v| v.parse().ok()) {
@@ -177,7 +173,7 @@ fn main() -> Result<()> {
             if let Some(n) = std::env::var("VICTORY_HOST_WAVE").ok().and_then(|v| v.parse().ok()) {
                 victory_shader::emit::set_host_max_wave(n);
             }
-            translate::run(paths, validate, pipelines, list, jobs, warm)
+            translate::run(paths, validate, pipelines, list, jobs)
         }
         Command::Warm { paths, jobs, no_pipelines } => translate::warm(paths, jobs, !no_pipelines),
         Command::Run {
@@ -187,15 +183,7 @@ fn main() -> Result<()> {
             execute,
             console,
             title_args: _,
-        } => {
-            let result = run::run(&exe, unimplemented, strict, execute, console);
-            // The process's own end, as `main`'s Result maps it: Ok is 0,
-            // Err is 1. A title that ends the process itself logs its own
-            // line and never returns here.
-            let code = if result.is_ok() { 0 } else { 1 };
-            tracing::info!("runtime exit: code {code}");
-            result
-        }
+        } => run::run(&exe, unimplemented, strict, execute, console),
         Command::Config => show_config(),
     }
 }

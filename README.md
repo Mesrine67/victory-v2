@@ -1,4 +1,61 @@
-# victory-fork — VIctory, RTX 5080 build
+# ShakiraRED(dt) — VIctory V1
+
+An experimental performance fork of [Trexies/VIwork](https://github.com/Trexies/victory-fork/tree/VIwork), based on [VIctory](https://github.com/Marvisak/VIctory) and community contributions. This is a work in progress, with incomplete rendering and no guarantee of stability. The source and Windows executable are provided without game files or assets.
+
+## Status and testing
+
+Tested on Windows with an NVIDIA RTX 4090 using the Series X profile. Numbers below are individual samples from different gameplay scenes, not a benchmark average; scene load and shader readiness affect results.
+
+| Test | Observed result |
+| --- | --- |
+| Lighter gameplay scene | Peak 20.0 FPS at about 2,627 draw calls; five preceding samples ranged from 18.3 to 19.5 FPS |
+| Another gameplay run | 17.6–18.8 FPS across five samples at about 2,700 draws; the peak sample also reported 462 dropped draws from missing host pipelines |
+| Heavier gameplay scene | 13.7–15.0 FPS at roughly 5,500–5,700 draws |
+| Separate V1 performance check | 12.8 FPS at approximately 5,508 draws |
+| High-load spike | 1.8 FPS at about 10,262 draws; 567 ms per frame |
+
+The gameplay launch used `VICTORY_AMBIENT=0.6`, `VICTORY_CARD_BUFFERS_MB=4096`, `VICTORY_CARD_WINDOWS_MB=4096` and `VICTORY_WIDE_MERGE=1`, with a populated shader cache. Samples are roughly one-second averages logged about every five seconds. The examples were not controlled camera-matched comparisons. Missing pipelines can reduce draw work, so FPS alone does not establish visual correctness. A separate run ended with `DXGI_ERROR_DEVICE_HUNG`; the exact GPU command responsible was not identified.
+
+## Changes in V1
+
+Compared with the Trexies `VIwork` baseline:
+
+- Retains the Belobug ambient lighting pass.
+- Adds incremental descriptor-heap scanning and texture/view handling changes.
+- Adds an own-view copy-back path, read/write locks and batching for memory and view tracking, plus parallel wide-merge work.
+- Ports asynchronous submit and fill-ahead paths, with configurable options, and adds submission/relay timing diagnostics.
+- Adds guarded in-place and plain-copy paths and fixes for nested wide-run re-entrancy and texture detiling.
+- Includes texture and descriptor stability fixes and GPU-side resource handling optimizations.
+
+See the source and its comments for individual switches and attribution. Features and behavior can depend on environment settings; the results above are observations from the tested configuration.
+
+## Build and run
+
+Requires Windows x64, Rust as pinned in `rust-toolchain.toml`, a compatible Direct3D 12 GPU, and the user-supplied title files. No title files or cached title data are distributed here.
+
+Build from source, or download the standalone `victory.exe` from Releases. No PowerShell launcher is required. In Command Prompt, run from the directory containing `victory.exe`:
+
+```cmd
+set "VICTORY_AMBIENT=0.6"
+set "VICTORY_CARD_BUFFERS_MB=4096"
+set "VICTORY_CARD_WINDOWS_MB=4096"
+set "VICTORY_WIDE_MERGE=1"
+victory.exe run "<path-to-your-title-executable>" --execute --console series-x
+```
+
+To build it yourself, run `cargo build --release -p victory`; the executable is written to `target\release\victory.exe`.
+
+## Credits and license
+
+Based on [Trexies/VIwork](https://github.com/Trexies/victory-fork/tree/VIwork), [VIctory](https://github.com/Marvisak/VIctory), and the community work credited in the upstream README and source. GPL-3.0-or-later; see [LICENSE](LICENSE).
+
+---
+
+## Upstream README
+
+The following is the inherited upstream documentation. Its hardware, status and FPS observations describe upstream configurations, not the ShakiraRED V1 test above.
+
+# VIctory fork (work in progress)
 
 A GPL-3.0 fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer that runs an
 Xbox Series title natively on Windows from files you supply. **No game files or assets are included
@@ -107,14 +164,23 @@ line; dumps from issue #4 make the same point. The CSV does not carry that P% ye
 - PowerShell does not expand `%LOCALAPPDATA%`; use `$env:LOCALAPPDATA` or the `.cmd`.
 - The file appears on the first presented frame (~1 s), not at launch.
 
-Only want the dump tool in an existing fork? Use the dev patch repo:
-[`skornuta/victory-frametime`](https://github.com/skornuta/victory-frametime).
+Speed and memory:
+- Waits for memory values, write-watch queries and page queries no longer walk page tables per call.
+- Large title buffers get a copy in card memory, with shader writes found by hashing on the card.
+- Submissions can be sent ahead of the wait for the card (`VICTORY_LATE_WAIT`), with a relay thread that lands results as the card finishes (`VICTORY_RELAY`): in a first five-minute run the card's idle time behind the submitting thread fell from about 136 to 30 ms per frame.
+- Independent host-copy refreshes run in parallel by default on systems with at least four logical CPUs (`VICTORY_WIDE_REFRESH=0` disables this; `=1` forces it). This targets the serial memory reads that previously cost about 45–50 ms per frame on the test run.
+- Title memory can be opened as a graphics heap so that buffers are used in place instead of copied (`VICTORY_INPLACE`, first stage only; a probe confirmed the approach on the test GPU).
+- The bindless texture queue no longer uploads stale views; the view table no longer grows without bound; the pipeline library is mapped instead of read into memory.
+- An intermittent device loss was traced to the pipeline library file being replaced while mapped; fixed.
 
 ## Community dumps
 
-`dumps/` holds frametime CSVs captured on real machines, with a short index in
-[`dumps/README.md`](dumps/README.md). They are the raw input for the bucket comparison above; add
-your own with `VICTORY_FRAMETIME_DUMP=1`.
+Most of the newer speed changes sit behind environment switches that are off
+by default (`VICTORY_LATE_WAIT`, `VICTORY_RELAY`, `VICTORY_WIDE_BACK`,
+`VICTORY_CARD_BUFFERS_MIN_MB`, `VICTORY_INPLACE`, `VICTORY_BVH_BUILDER`, ...).
+Independent host-copy refreshes are the exception: they use parallel workers
+automatically on systems with at least four logical CPUs. Each switch is
+described in a comment where it is read.
 
 ## Build and run
 
@@ -150,7 +216,26 @@ set VICTORY_JOIN_COPIES=1
 set VICTORY_FRAMETIME_DUMP=1
 ```
 
-### Where the dump goes
+| Variable | Effect |
+|----------|--------|
+| `VICTORY_LOG=<target>=debug,...` | debug and trace output |
+| `VICTORY_STACKS=20,60` | every thread's stack at those seconds |
+| `VICTORY_WATCH=<rva>,...` | logs a title u32 when it changes |
+| `VICTORY_KEYS=30:Enter,35:X` | presses keys at those seconds, focus or not |
+| `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
+| `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`) |
+| `VICTORY_DUMP_TARGETS=1` | with the two above, saves every render target of those frames |
+| `VICTORY_D3D12_DEBUG=1` | host debug layer |
+| `VICTORY_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |
+| `VICTORY_D3D12_DRED=1` | on a GPU failure, the allocation hit and the commands in flight |
+| `VICTORY_PIPELINE_WAIT_MS=24` | reduce the per-frame wait for background pipeline creation from the default of 500 ms. A draw can be omitted until its pipeline is ready |
+| `VICTORY_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash |
+| `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands |
+| `VICTORY_CARD_HASH_WIDE=0` | the passes that find what shaders wrote to copies in the card's memory hash with one thread per 64 KiB, as before |
+| `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
+| `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
+| `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
+| `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
 
 | `VICTORY_FRAMETIME_DUMP` | File |
 |---|---|
@@ -161,36 +246,5 @@ set VICTORY_FRAMETIME_DUMP=1
 Builds before `646f5cf` wrote `=1` to `%TEMP%\victory-frametime.csv` instead; if the cache path is
 empty, check there. An explicit absolute path works on every build.
 
-`=1` follows Victory's `cache_dir`, so `VICTORY_CACHE_DIR` or a `victory.toml` moves it; `victory config`
-prints the resolved `cache_dir`. The file is created on the **first presented frame** (~1 s after the
-title starts presenting) and is **truncated at the start of every run**, so each run gets a fresh file.
-The log also prints `frametime dump path=...` when it opens.
+GPL-3.0-or-later. See [LICENSE](LICENSE).
 
-In PowerShell, use `$env:VICTORY_FRAMETIME_DUMP = '1'` — `%TEMP%`/`%LOCALAPPDATA%` are not expanded
-there.
-
-Every dump starts with `#` lines naming the machine (CPU, GPU + VRAM, driver, RAM, OS, board,
-display) and the `VICTORY_*` switches, then the CSV header and rows. `pandas.read_csv(path,
-comment='#')` reads it directly.
-
-## Known issues
-
-- **Dropped draws:** ~350–550 draws/frame are skipped for lack of a host pipeline (mesh pipelines
-  refused with `0x80070057` among them). This is the main correctness gap seen here.
-- **Long present gaps:** 2.5–4.9 s gaps with no heap/GPU cost; the current buckets can't attribute
-  them (loading? pipeline? page-in?).
-- **Shadowed areas are black** and ray-traced light does not run — inherited from the merged tree.
-- Memory in play is high (~14–15 GB working set on this machine).
-
-## Credits and licence
-
-VIctory is by [Marvisak](https://github.com/Marvisak/VIctory) and its contributors. The community
-fixes merged here are the work of the authors of
-[`ZSlayerHQ/victory-world-runtime`](https://github.com/ZSlayerHQ/victory-world-runtime),
-[`fxceless/victory-fork`](https://github.com/fxceless/victory-fork),
-[`myokex/victory-amd`](https://github.com/myokex/victory-amd),
-[`Trexies/victory-fork`](https://github.com/Trexies/victory-fork) and
-[`WillyboPeep/victory-all-forks`](https://github.com/WillyboPeep/victory-all-forks); see their
-histories and READMEs. Proudnoob4's PRs #5/#6 and issue #3's analysis are part of this tree;
-the dumps in `dumps/` are from their authors. [XCL](https://github.com/ivall/xcl) was used as a
-reference for how the same title behaves under another layer. GPL-3.0, following upstream.
