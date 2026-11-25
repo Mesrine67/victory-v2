@@ -90,9 +90,21 @@ set VICTORY_JOIN_COPIES=1
 set VICTORY_FRAMETIME_DUMP=1
 ```
 
-`VICTORY_FRAMETIME_DUMP=1` is created on the first presented frame (~1 s in) and truncated at the
-start of each run, so each run gets a fresh file. In PowerShell use
-`$env:VICTORY_FRAMETIME_DUMP = '1'` — `%TEMP%`/`%LOCALAPPDATA%` are not expanded there.
+### Where the dump goes
+
+| `VICTORY_FRAMETIME_DUMP` | File |
+|---|---|
+| unset or empty | no dump |
+| `1` | `%LOCALAPPDATA%\victory\cache\frametime.csv` — e.g. `C:\Users\<you>\AppData\Local\victory\cache\frametime.csv` |
+| any other value | exactly that path (its folder must already exist) |
+
+`=1` follows Victory's `cache_dir`, so `VICTORY_CACHE_DIR` or a `victory.toml` moves it; `victory config`
+prints the resolved `cache_dir`. The file is created on the **first presented frame** (~1 s after the
+title starts presenting) and is **truncated at the start of every run**, so each run gets a fresh file.
+The log also prints `frametime dump path=...` when it opens.
+
+In PowerShell, use `$env:VICTORY_FRAMETIME_DUMP = '1'` — `%TEMP%`/`%LOCALAPPDATA%` are not expanded
+there.
 
 Every dump starts with `#` lines naming the machine (CPU, GPU + VRAM, RAM, OS, board, display) and
 the `VICTORY_*` switches, then the CSV header and rows. `pandas.read_csv(path, comment='#')` reads
