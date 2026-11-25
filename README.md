@@ -99,6 +99,9 @@ dump itself.
 - PowerShell does not expand `%LOCALAPPDATA%`; use `$env:LOCALAPPDATA` or the `.cmd`.
 - The file appears on the first presented frame (~1 s), not at launch.
 
+Only want the dump tool in an existing fork? Use the dev patch repo:
+[`skornuta/victory-frametime`](https://github.com/skornuta/victory-frametime).
+
 ## Community dumps
 
 `dumps/` holds frametime CSVs captured on real machines, with a short index in
