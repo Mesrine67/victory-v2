@@ -104,6 +104,9 @@ set VICTORY_FRAMETIME_DUMP=1
 | `1` | `%LOCALAPPDATA%\victory\cache\frametime.csv` — e.g. `C:\Users\<you>\AppData\Local\victory\cache\frametime.csv` |
 | any other value | exactly that path (its folder must already exist) |
 
+Builds before `646f5cf` wrote `=1` to `%TEMP%\victory-frametime.csv` instead; if the cache path is
+empty, check there. An explicit absolute path works on every build.
+
 `=1` follows Victory's `cache_dir`, so `VICTORY_CACHE_DIR` or a `victory.toml` moves it; `victory config`
 prints the resolved `cache_dir`. The file is created on the **first presented frame** (~1 s after the
 title starts presenting) and is **truncated at the start of every run**, so each run gets a fresh file.
