@@ -175,7 +175,16 @@ fn main() -> Result<()> {
             }
             translate::run(paths, validate, pipelines, list, jobs)
         }
-        Command::Warm { paths, jobs, no_pipelines } => translate::warm(paths, jobs, !no_pipelines),
+        Command::Warm { paths, jobs, no_pipelines } => {
+            // Warm with the run's key: the 5080's wave width and view-heap limit.
+            if let Some(n) = std::env::var("VICTORY_VIEW_LIMIT").ok().and_then(|v| v.parse().ok()) {
+                victory_shader::emit::set_view_heap_limit(n);
+            }
+            if let Some(n) = std::env::var("VICTORY_HOST_WAVE").ok().and_then(|v| v.parse().ok()) {
+                victory_shader::emit::set_host_max_wave(n);
+            }
+            translate::warm(paths, jobs, !no_pipelines)
+        }
         Command::Run {
             exe,
             unimplemented,
