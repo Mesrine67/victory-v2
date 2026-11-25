@@ -94,6 +94,10 @@ set VICTORY_FRAMETIME_DUMP=1
 start of each run, so each run gets a fresh file. In PowerShell use
 `$env:VICTORY_FRAMETIME_DUMP = '1'` — `%TEMP%`/`%LOCALAPPDATA%` are not expanded there.
 
+Every dump starts with `#` lines naming the machine (CPU, GPU + VRAM, RAM, OS, board, display) and
+the `VICTORY_*` switches, then the CSV header and rows. `pandas.read_csv(path, comment='#')` reads
+it directly.
+
 ## Known issues
 
 - **Dropped draws:** ~350–550 draws/frame are skipped for lack of a host pipeline (mesh pipelines
