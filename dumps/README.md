@@ -1,7 +1,8 @@
 # Community frametime dumps
 
-Samples captured on the earlier line. The V1 performance tree in this fork does not yet re-port the
-frametime dump tool; these files are kept for comparison.
+These files were captured on earlier lines and are kept for comparison. The merged
+Neptune tree in this fork carries the dump tool again (`VICTORY_FRAMETIME_DUMP=1`,
+or `run-neptune.cmd -FrametimeDump`), so new samples can be added the same way.
 
 CSV captures from `VICTORY_FRAMETIME_DUMP=1` on real machines, for comparing the frame buckets and
 the 1–2 s drops across hardware. Each file is one run. When the `#` header is present it names the
