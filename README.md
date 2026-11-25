@@ -1,5 +1,10 @@
 # victory-fork — Neptune (VIctory Edit) build
 
+**Public try-build while the community mega fork is being finished.** The same
+lines are merged here, so you can run and measure today. See
+[`PREVIEW.md`](PREVIEW.md) for what is already in, what is still landing, and
+what to report.
+
 This fork now carries **Neptune**, traffic & zm0kie's build of the VIctory runtime,
 on top of the myokex / fxceless / JoshuaO22 line. It replaces the earlier
 ShakiraRED V1 tree, because Neptune already includes the two things that tree was
