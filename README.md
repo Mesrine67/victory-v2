@@ -56,9 +56,10 @@ NVIDIA cards use 32 and 999999 (see the run log's `host wave lanes` and
 run-v1.cmd "<game>\game_scarlett_master.exe"
 ```
 
-The checked-in `run-v1.cmd` carries the tested settings. `run-v1-2048.cmd` is an
-experiment that gives 4 GB of card-side buffers back to textures (useful if
-textures are missing; the default 4096 measured better in the settled scene).
+The checked-in `run-v1.cmd` carries the tested settings. Keep
+`CARD_BUFFERS_MB`/`CARD_WINDOWS_MB` at **4096**: at 2048 the same scene measured
+about **3 fps / 333 ms with 11,800 textures waiting** and a 91 ms heap pass,
+because the smaller card-side buffers make the heap and copies thrash.
 
 ## What is in this tree
 
