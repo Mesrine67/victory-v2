@@ -1,3 +1,53 @@
+# ShakiraRED(dt) — VIctory V1
+
+An experimental performance fork of [Trexies/VIwork](https://github.com/Trexies/victory-fork/tree/VIwork), based on [VIctory](https://github.com/Marvisak/VIctory) and community contributions. This is a work in progress, with incomplete rendering and no guarantee of stability. The source and Windows executable are provided without game files or assets.
+
+## Status and testing
+
+Tested on Windows with an NVIDIA RTX 4090 using the Series X profile. Numbers below are individual samples from different gameplay scenes, not a benchmark average; scene load and shader readiness affect results.
+
+| Test | Observed result |
+| --- | --- |
+| Lighter gameplay scene | Peak 20.0 FPS at about 2,627 draw calls; five preceding samples ranged from 18.3 to 19.5 FPS |
+| Another gameplay run | 17.6–18.8 FPS across five samples at about 2,700 draws; the peak sample also reported 462 dropped draws from missing host pipelines |
+| Heavier gameplay scene | 13.7–15.0 FPS at roughly 5,500–5,700 draws |
+| Separate V1 performance check | 12.8 FPS at approximately 5,508 draws |
+| High-load spike | 1.8 FPS at about 10,262 draws; 567 ms per frame |
+
+Samples are roughly one-second averages logged about every five seconds. The examples were not controlled camera-matched comparisons. Missing pipelines can reduce draw work, so FPS alone does not establish visual correctness. A separate run ended with `DXGI_ERROR_DEVICE_HUNG`; the exact GPU command responsible was not identified.
+
+## Changes in V1
+
+Compared with the Trexies `VIwork` baseline:
+
+- Retains the Belobug ambient lighting pass.
+- Adds incremental descriptor-heap scanning and texture/view handling changes.
+- Adds an own-view copy-back path, read/write locks and batching for memory and view tracking, plus parallel wide-merge work.
+- Ports asynchronous submit and fill-ahead paths, with configurable options, and adds submission/relay timing diagnostics.
+- Adds guarded in-place and plain-copy paths and fixes for nested wide-run re-entrancy and texture detiling.
+- Includes texture and descriptor stability fixes and GPU-side resource handling optimizations.
+
+See the source and its comments for individual switches and attribution. Features and behavior can depend on environment settings; the results above are observations from the tested configuration.
+
+## Build and run
+
+Requires Windows x64, Rust as pinned in `rust-toolchain.toml`, a compatible Direct3D 12 GPU, and the user-supplied title files. No title files or cached title data are distributed here.
+
+```powershell
+cargo build --release -p victory
+target\release\victory.exe run "<path-to-your-title-executable>" --execute --console series-x
+```
+
+## Credits and license
+
+Based on [Trexies/VIwork](https://github.com/Trexies/victory-fork/tree/VIwork), [VIctory](https://github.com/Marvisak/VIctory), and the community work credited in the upstream README and source. GPL-3.0-or-later; see [LICENSE](LICENSE).
+
+---
+
+## Upstream README
+
+The following is the inherited upstream documentation. Its hardware, status and FPS observations describe upstream configurations, not the ShakiraRED V1 test above.
+
 # VIctory fork (work in progress)
 
 ## victory-amd
