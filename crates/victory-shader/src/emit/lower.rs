@@ -62,6 +62,8 @@ pub(crate) struct Lowered {
     /// Heap handles made with a non-uniform index.
     #[cfg(test)]
     pub nonuniform_handles: u32,
+    #[cfg(test)]
+    pub barrier_modes: Vec<u32>,
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
@@ -262,6 +264,11 @@ struct Lower<'a> {
     clane: Option<V>,
     /// The first exchange dword of this thread's console wave ([`Self::exchange_pair`]).
     pair: Option<V>,
+    /// With `exchange` and `ds_bpermute_b32` in a group over 32 threads: the LDS
+    /// base dword of the 64-dword-per-console-wave scratch, and the cached
+    /// `(wave_off, base)` pair for this thread's console wave in the entry block.
+    bpermute_slot: Option<u32>,
+    bpermute_base: Option<(V, V)>,
     /// A console wave64 program in host waves of 32: the LDS dword counting the console threads
     /// handed to host waves (`wave_base`), and the base made in the entry block.
     halves: Option<u32>,
@@ -1016,7 +1023,8 @@ fn own_bits_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_OWN_BITS").is_none_or(|v| v != "0"))
 }
 
-pub(super) fn host_max_wave() -> u32 {
+/// The host's widest wave, or zero before the device reports it.
+pub fn host_max_wave() -> u32 {
     #[cfg(test)]
     if let Some(lanes) = TEST_HOST_WAVE.get() {
         return lanes;
@@ -1221,6 +1229,25 @@ fn half_input_partners(io: &StageIo, inputs: &[SigElement]) -> HashMap<u8, u8> {
     partners
 }
 
+/// The title's barrier retains its memory fences even when group sync
+/// would wait for a host wave that never visits it. Explicit overrides
+/// keep their old meanings; automatic mode only changes narrower hosts.
+fn barrier_mode(
+    setting: u8,
+    host_wave: u32,
+    console_wave: u32,
+    divergent: bool,
+    writes_uavs: bool,
+) -> u32 {
+    let waits = match setting {
+        0 => false,
+        1 => !divergent,
+        2 => true,
+        _ => !(host_wave != 0 && host_wave < console_wave && divergent),
+    };
+    8 | if writes_uavs { 2 } else { 0 } | u32::from(waits)
+}
+
 fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
 }
@@ -1250,6 +1277,8 @@ impl<'a> Lower<'a> {
         let mut lds_meet: Option<(Vec<bool>, Vec<(bool, bool)>)> = None;
         // a console wave64 program in two host waves of 32 (`exchange`)
         let mut exchange: Option<(u32, bool, Vec<bool>)> = None;
+        // 64-dword-per-console-wave LDS scratch for cross-half `ds_bpermute_b32`
+        let mut bpermute_slot: Option<u32> = None;
         // a console wave64 program in host waves of 32: the LDS dword of `wave_base`'s counter
         let mut halves: Option<u32> = None;
         if let StageIo::Cs(cs) = x.native.io {
@@ -1331,6 +1360,18 @@ impl<'a> Lower<'a> {
                                 // numbers go through two exchange dwords past the program's LDS
                                 exchange = Some((s.lds_dwords, group <= 32, all));
                                 s.lds_dwords += 2 * group.div_ceil(64);
+                                if group > 32
+                                    && !LOCAL_WAVES.get()
+                                    && insts().any(|i| i.name() == "ds_bpermute_b32")
+                                {
+                                    let scratch = 64 * group.div_ceil(64);
+                                    // Reserve 1 dword for `halves`'s `wave_base` counter inside
+                                    // D3D12's 32 KiB (8,192 dword) groupshared limit.
+                                    if s.lds_dwords + scratch < 8192 {
+                                        bpermute_slot = Some(s.lds_dwords);
+                                        s.lds_dwords += scratch;
+                                    }
+                                }
                             }
                         }
                     }
@@ -1535,6 +1576,8 @@ impl<'a> Lower<'a> {
             exchange,
             clane: None,
             pair: None,
+            bpermute_slot,
+            bpermute_base: None,
             halves,
             wave_base: None,
             flat: None,
@@ -2209,6 +2252,8 @@ impl<'a> Lower<'a> {
             root_uavs,
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
+            #[cfg(test)]
+            barrier_modes: self.s.m.barrier_modes(),
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             dxil: self.s.finish(),
@@ -3693,6 +3738,23 @@ impl<'a> Lower<'a> {
         v
     }
 
+    /// `(wave_off, base)` for cross-half `ds_bpermute_b32` (made in the entry
+    /// block): `wave_off` is this console wave's first thread index (`thread & !63`)
+    /// and `base` is its 64-dword scratch start (`slot + wave_off`).
+    fn bpermute_base(&mut self, slot: u32) -> (V, V) {
+        if let Some(pair) = self.bpermute_base {
+            return pair;
+        }
+        let e = self.s.entry;
+        let thread = self.console_thread();
+        let mask = self.s.m.i32(!63);
+        let wave_off = self.s.m.bin(e, Bin::And, thread, mask);
+        let start = self.s.m.i32(slot);
+        let base = self.s.m.bin(e, Bin::Add, start, wave_off);
+        self.bpermute_base = Some((wave_off, base));
+        (wave_off, base)
+    }
+
     /// The console's decision of the branch closing IR block `b`, which the wave takes
     /// together ([`Structured::wide`]): `when` is the lane's own bit, and the branch is taken
     /// when some lane's `when` holds (`execnz`, `vccnz`, SCC of a mask operation set) or
@@ -4355,11 +4417,6 @@ impl<'a> Lower<'a> {
             // host (it left through a branch, not a guard) is read as the
             // host gives it; the console reads 0.
             self.cross_lane(false)?;
-            if self.exchange.as_ref().is_some_and(|e| !e.1) {
-                // a console wave of 64 run as two host waves: the lane named
-                // may be in the other one
-                return Err("a lane permute across two host waves");
-            }
             let at = self.vgprs(inst, addr.as_ref().ok_or("a permute address")?, 1)?[0];
             let x = self.vgprs(inst, data.first().ok_or("a permute source")?, 1)?[0];
             let o = self.s.m.i32(offset);
@@ -4375,7 +4432,62 @@ impl<'a> Lower<'a> {
                 }
                 None => x,
             };
-            let r = self.read_lane(x, src);
+            let r = match self.exchange.as_ref().map(|e| e.1) {
+                Some(true) => {
+                    // Console wave64 in a single 32-lane host wave (`group <= 32`):
+                    // lanes 32..63 do not exist and must read 0 without passing an
+                    // out-of-bounds lane index to `WaveReadLaneAt`.
+                    let k32 = self.s.m.i32(32);
+                    let k31 = self.s.m.i32(31);
+                    let z = self.s.m.i32(0);
+                    let in_half = self.s.m.cmp(c, pred::IULT, src, k32);
+                    let lane = self.s.m.bin(c, Bin::And, src, k31);
+                    let r = self.read_lane(x, lane);
+                    self.s.m.select(c, in_half, r, z)
+                }
+                Some(false) if self.local && self.local_any => {
+                    let k31 = self.s.m.i32(31);
+                    let lane = self.s.m.bin(c, Bin::And, src, k31);
+                    self.read_lane(x, lane)
+                }
+                Some(false) if self.local => {
+                    return Err("a lane permute in a half-wave");
+                }
+                Some(false) => {
+                    // Console wave64 across two 32-lane host waves: exchange all 64
+                    // lanes through a 64-dword-per-console-wave LDS scratch buffer.
+                    if !self.all_lanes(self.cur_ir) {
+                        need(self.cur_ir);
+                        return Err("a lane permute where not every lane runs");
+                    }
+                    let Some(slot) = self.bpermute_slot else {
+                        return Err("a lane permute across two host waves (not enough LDS)");
+                    };
+                    let (wave_off, base) = self.bpermute_base(slot);
+                    let cl = self.console_lane();
+                    let dst_idx = self.s.m.bin(c, Bin::Add, base, cl);
+                    let lds = self.s.lds();
+                    let dst_ptr = self.s.m.element(c, lds, dst_idx);
+                    self.s.m.store(c, dst_ptr, x);
+                    self.group_sync(c);
+                    let src_idx = self.s.m.bin(c, Bin::Add, base, src);
+                    let src_ptr = self.s.m.element(c, lds, src_idx);
+                    let mut r = self.s.m.load(c, src_ptr);
+                    self.group_sync(c);
+                    // Partial final console wave (`group % 64 != 0`): lanes at or past
+                    // `group` never ran and left their scratch dwords uninitialised.
+                    let group = self.s.threads.map_or(0, |t| t.iter().product::<u32>());
+                    if !group.is_multiple_of(64) {
+                        let abs_src = self.s.m.bin(c, Bin::Add, wave_off, src);
+                        let limit = self.s.m.i32(group);
+                        let in_group = self.s.m.cmp(c, pred::IULT, abs_src, limit);
+                        let z = self.s.m.i32(0);
+                        r = self.s.m.select(c, in_group, r, z);
+                    }
+                    r
+                }
+                None => self.read_lane(x, src),
+            };
             let reg = dst_reg.ok_or("a permute result")?;
             self.write(inst, Reg::V(reg), r, guard);
             return Ok(());
@@ -4723,17 +4835,15 @@ impl<'a> Lower<'a> {
                 // Thread-group sync with a shared-memory fence, and a UAV
                 // fence when the program writes UAVs (the waits before an
                 // s_barrier make those writes visible on the console).
-                let mut mode = if self.writes_uavs { 1 | 2 | 8 } else { 1 | 8 };
-                // Without the wait for the group (bit 0) where not every
-                // lane arrives, or where the switch says so.
-                let waits = match super::group_sync() {
-                    0 => false,
-                    1 => !self.fence_only.contains(&b),
-                    _ => true,
-                };
-                if !waits {
-                    mode &= !1;
-                }
+                let setting = super::group_sync();
+                let divergent = self.fence_only.contains(&b);
+                let mode = barrier_mode(
+                    setting,
+                    host_max_wave(),
+                    self.wave(),
+                    divergent,
+                    self.writes_uavs,
+                );
                 let mode = self.s.m.i32(mode);
                 let void = self.s.t.void;
                 self.s
@@ -11123,6 +11233,81 @@ mod tests {
     use crate::{io, ir, resource, structure};
 
     const S_ENDPGM: u32 = 0xBF81_0000;
+
+    #[test]
+    fn automatic_barriers_keep_fences_and_only_drop_unsafe_sync() {
+        for writes in [false, true] {
+            let fence = 8 | if writes { 2 } else { 0 };
+            for (host, console, divergent, waits) in [
+                (32, 64, true, false),
+                (32, 64, false, true),
+                (64, 64, true, true),
+                (32, 32, true, true),
+                (0, 64, true, true),
+            ] {
+                assert_eq!(
+                    super::barrier_mode(3, host, console, divergent, writes),
+                    fence | u32::from(waits),
+                );
+            }
+            assert_eq!(super::barrier_mode(0, 32, 64, false, writes), fence);
+            assert_eq!(super::barrier_mode(1, 64, 64, true, writes), fence);
+            assert_eq!(super::barrier_mode(1, 32, 64, false, writes), fence | 1);
+            assert_eq!(super::barrier_mode(2, 32, 64, true, writes), fence | 1);
+        }
+    }
+
+    #[test]
+    fn automatic_barrier_flags_reach_the_emitted_shader() {
+        let divergent = [
+            0x7D88_0090, // v_cmp_gt_u32 vcc, 16, v0
+            0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+            0xBF88_0001, // s_cbranch_execz past the barrier
+            0xBF8A_0000, // s_barrier
+            0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        ];
+        let mut divergent32 = divergent;
+        divergent32[1] = 0xBE8C_3C6A; // s_and_saveexec_b32 s12, vcc_lo
+        divergent32[4] = 0xBEFE_030C; // s_mov_b32 exec_lo, s12
+        for (body, wave64, host, expected) in [
+            (&divergent[..], true, 32, 8),
+            (&divergent[..], true, 64, 9),
+            (&divergent32[..], false, 32, 9),
+            (&[0xBF8A_0000][..], true, 32, 9),
+        ] {
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64,
+                vgprs: 16,
+                layout: vec![],
+                used: vec![],
+                io: StageIo::Cs(ComputeIo { rsrc2: 0, threads: [64, 1, 1] }),
+                code: body.iter().copied().chain([S_ENDPGM])
+                    .flat_map(u32::to_le_bytes).collect(),
+            };
+            let p = ir::build(&native.code, wave64, native.vgprs).expect("IR");
+            let st = structure::structure(&p).expect("structure");
+            let res = resource::track(&p, &[], native.stage, Some(&st)).expect("resources");
+            let io = io::raise(&p, &native).expect("IO");
+            let old_wave = super::TEST_HOST_WAVE.replace(Some(host));
+            let old_mode = super::super::TEST_GROUP_SYNC.replace(Some(3));
+            let shader = lower(&Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs: vec![],
+                prims: vec![],
+                mesh_stride: 0,
+            });
+            super::TEST_HOST_WAVE.set(old_wave);
+            super::super::TEST_GROUP_SYNC.set(old_mode);
+            let shader = shader.unwrap_or_else(|e| panic!("wave64={wave64}, host={host}: {e:?}"));
+            assert_eq!(shader.barrier_modes, vec![expected]);
+        }
+    }
 
     #[test]
     fn packed_pixel_inputs_find_their_second_row() {

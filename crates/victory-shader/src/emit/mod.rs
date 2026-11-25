@@ -110,7 +110,7 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use bitcode::census;
 pub use sampler::StaticSampler;
-pub use lower::set_host_max_wave;
+pub use lower::{host_max_wave, set_host_max_wave};
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
@@ -124,20 +124,17 @@ pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
 /// The iteration count after which a translated loop is left, per lane and
 /// per entry into the loop: [`DEFAULT_LOOP_LIMIT`].
 ///
-/// With the `diagnostics` feature, `VICTORY_SHADER_LOOP_LIMIT` (decimal or
-/// `0x` hex, at least 1) sets it instead. A loop that hits the limit in
-/// every lane of a full-screen pass still runs for seconds (2^20 times a
-/// 4K screen is about 10^13 iterations); a much lower limit shows whether
-/// such loops are what makes a frame slow. The value is part of the
-/// translation, so the shader cache must key on it (`victory-gpu`'s does).
+/// `VICTORY_SHADER_LOOP_LIMIT` (decimal or `0x` hex, at least 1) sets it
+/// instead, in release builds too. A loop that hits the limit in every lane
+/// of a full-screen pass still runs for seconds (2^20 times a 4K screen is
+/// about 10^13 iterations); a much lower limit both shows whether such loops
+/// make a frame slow and keeps a mistranslated loop from running until
+/// Windows resets the card. The value is part of the translation, so the
+/// shader cache must key on it (`victory-gpu`'s does).
 pub fn loop_limit() -> u32 {
     static LIMIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *LIMIT.get_or_init(|| {
-        if cfg!(feature = "diagnostics") {
-            parse_loop_limit(std::env::var("VICTORY_SHADER_LOOP_LIMIT").ok().as_deref())
-        } else {
-            lower::LOOP_LIMIT
-        }
+        parse_loop_limit(std::env::var("VICTORY_SHADER_LOOP_LIMIT").ok().as_deref())
     })
 }
 
@@ -148,7 +145,10 @@ pub fn loop_limit() -> u32 {
 /// thread: the group stands until Windows resets the card. (The console's
 /// barrier is the wave's, whatever lanes are live, and a wave that ended
 /// is not waited for.) `VICTORY_GROUP_SYNC`:
-/// - unset or `2`: every barrier waits, as before.
+/// - unset or `2`: every barrier waits, as before (the safe default).
+/// - `auto` or `3`: on hosts narrower than the console wave, the title's
+///   divergent barriers retain their memory fences but do not wait. Other
+///   hosts and uniform barriers keep their group sync.
 /// - `1`: the title's `s_barrier` waits only in a block every lane runs,
 ///   in a program no lane can be cut out of at the iteration limit.
 /// - `0`: no barrier waits, neither the title's nor the ones the
@@ -160,12 +160,27 @@ pub fn loop_limit() -> u32 {
 /// Part of the translation: the shader cache keys on it (`victory-gpu`'s
 /// does).
 pub fn group_sync() -> u8 {
+    #[cfg(test)]
+    if let Some(mode) = TEST_GROUP_SYNC.get() {
+        return mode;
+    }
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| match std::env::var("VICTORY_GROUP_SYNC").ok().as_deref().map(str::trim) {
+    *MODE.get_or_init(|| parse_group_sync(std::env::var("VICTORY_GROUP_SYNC").ok().as_deref()))
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_GROUP_SYNC: std::cell::Cell<Option<u8>> = const { std::cell::Cell::new(None) };
+}
+
+fn parse_group_sync(value: Option<&str>) -> u8 {
+    match value.map(str::trim) {
         Some("0") => 0,
         Some("1") => 1,
+        Some("2") => 2,
+        Some("auto") | Some("3") => 3,
         _ => 2,
-    })
+    }
 }
 
 /// The clean-up passes that run over a translated program before it is
@@ -759,6 +774,17 @@ mod tests {
     use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
     use super::parse_loop_limit;
+
+    #[test]
+    fn group_sync_defaults_to_every_barrier_and_keeps_explicit_overrides() {
+        for value in [None, Some(""), Some("invalid")] {
+            assert_eq!(super::parse_group_sync(value), 2);
+        }
+        assert_eq!(super::parse_group_sync(Some("auto")), 3);
+        for (value, mode) in [("0", 0), (" 1 ", 1), ("2", 2), ("3", 3)] {
+            assert_eq!(super::parse_group_sync(Some(value)), mode);
+        }
+    }
 
     #[test]
     fn the_clean_up_switch_parses_or_runs_every_pass() {
