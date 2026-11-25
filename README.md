@@ -34,6 +34,9 @@ this fork's changes on top.
   (`ds_bpermute_b32` cross-half scratch).
 - **Pipeline workers** — `VICTORY_PIPELINE_WORKERS` (default: half the logical CPUs, 2–8) and
   `VICTORY_PIPELINE_PRIORITY`.
+- **Merged community PRs** — #5 (the host D3D12 device is made before the title runs, so a slow
+  driver cache cannot trip the title's 30 s watchdog) and #6 (the texture catch-up allowance resets
+  per scene once the backlog settles), both by Proudnoob4.
 - **`VICTORY_FRAMETIME_DUMP`** — `=1` writes `<cache>\frametime.csv` (default
   `%LOCALAPPDATA%\victory\cache\frametime.csv`); any other value is a path. One CSV row per ~1 s
   summary interval, with the frame time and the buckets the runtime already measures (`gpu_ms`,
@@ -48,7 +51,7 @@ Settled world on the merged build, 1440p, Series X profile: **~4.1–4.4 fps / 2
 
 | bucket | ms/frame |
 |---|---:|
-| `gpu_ms` | ~96–98 |
+| `gpu_ms` (submitting thread waits for the card) | ~96–98 |
 | `cpu_prepare_ms` | ~64–69 |
 | `copies_ms` | ~37–41 |
 | `copyback_ms` | ~27–28 |
@@ -61,6 +64,11 @@ is idle — i.e. asset binding/streaming, not GPU and not the file-read path. `c
 `copyback_ms` are ~27% of a frame. Separately, 2.5–4.9 s gaps between presents show no heap/GPU
 cost and are not attributed yet. Full sample writeup: `crates/victory-gpu/src/frametime.rs` and the
 dump itself.
+
+**Reading `gpu_ms`/`gpu_pct`:** with `VICTORY_RELAY` on they are the *submitting thread's wait for
+the card*, not how busy the card is. The real figure is the log's
+`the card's clock per frame: nothing of ours queued N ms (the card about P% busy by this count)`
+line; dumps from issue #4 make the same point. The CSV does not carry that P% yet.
 
 ## Capture a frametime dump
 
@@ -183,5 +191,6 @@ fixes merged here are the work of the authors of
 [`myokex/victory-amd`](https://github.com/myokex/victory-amd),
 [`Trexies/victory-fork`](https://github.com/Trexies/victory-fork) and
 [`WillyboPeep/victory-all-forks`](https://github.com/WillyboPeep/victory-all-forks); see their
-histories and READMEs. [XCL](https://github.com/ivall/xcl) was used as a reference for how the same
-title behaves under another layer. GPL-3.0, following upstream.
+histories and READMEs. Proudnoob4's PRs #5/#6 and issue #3's analysis are part of this tree;
+the dumps in `dumps/` are from their authors. [XCL](https://github.com/ivall/xcl) was used as a
+reference for how the same title behaves under another layer. GPL-3.0, following upstream.
