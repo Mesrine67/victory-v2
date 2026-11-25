@@ -62,6 +62,12 @@ is idle — i.e. asset binding/streaming, not GPU and not the file-read path. `c
 cost and are not attributed yet. Full sample writeup: `crates/victory-gpu/src/frametime.rs` and the
 dump itself.
 
+## Community dumps
+
+`dumps/` holds frametime CSVs captured on real machines, with a short index in
+[`dumps/README.md`](dumps/README.md). They are the raw input for the bucket comparison above; add
+your own with `VICTORY_FRAMETIME_DUMP=1`.
+
 ## Build and run
 
 ```sh
