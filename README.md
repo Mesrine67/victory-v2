@@ -33,10 +33,17 @@ See the source and its comments for individual switches and attribution. Feature
 
 Requires Windows x64, Rust as pinned in `rust-toolchain.toml`, a compatible Direct3D 12 GPU, and the user-supplied title files. No title files or cached title data are distributed here.
 
-```powershell
-cargo build --release -p victory
-target\release\victory.exe run "<path-to-your-title-executable>" --execute --console series-x
+Build from source, or download the standalone `victory.exe` from Releases. No PowerShell launcher is required. In Command Prompt, run from the directory containing `victory.exe`:
+
+```cmd
+set "VICTORY_AMBIENT=0.6"
+set "VICTORY_CARD_BUFFERS_MB=4096"
+set "VICTORY_CARD_WINDOWS_MB=4096"
+set "VICTORY_WIDE_MERGE=1"
+victory.exe run "<path-to-your-title-executable>" --execute --console series-x
 ```
+
+To build it yourself, run `cargo build --release -p victory`; the executable is written to `target\release\victory.exe`.
 
 ## Credits and license
 
