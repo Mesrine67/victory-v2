@@ -79,6 +79,12 @@ victory translate "D:\game\shaders.rpf" --warm
 victory run "D:\game\game.exe" --execute
 ```
 
+Or use the checked-in helper (sets `VICTORY_FRAMETIME_DUMP=1`; build first):
+
+```bat
+run-frametime.cmd "D:\game\game.exe"
+```
+
 Environment used for the measurements:
 
 ```bat
