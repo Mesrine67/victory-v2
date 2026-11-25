@@ -352,21 +352,48 @@ pub(crate) fn take_dropped() -> u64 {
 /// A root SRV's dynamic slot in a list, and the host copy it shows.
 type RootSlot = (u32, Option<std::sync::Arc<crate::shadow::Shadow>>);
 
-/// Takes `more` from the time a run may spend bringing in a long queue of
-/// textures at more than the usual pace; whether some is left.
-/// `VICTORY_TEXTURE_GATE_S` sets it (0: none).
-fn catching_up(more: std::time::Duration) -> bool {
-    static SPENT: AtomicU64 = AtomicU64::new(0);
+/// Per-backlog time allowance for bringing in a long queue of textures at
+/// more than the usual pace (`VICTORY_TEXTURE_GATE_S`, 60 s by default; 0
+/// disables catch-up). Resets once the queue drains to `settled` or fewer due
+/// slots so a subsequent scene load gets its own allowance.
+struct CatchupGate {
+    spent_ms: AtomicU64,
+}
+
+impl CatchupGate {
+    const fn new() -> Self {
+        Self { spent_ms: AtomicU64::new(0) }
+    }
+
+    fn has_budget(&self, total_ms: u64) -> bool {
+        self.spent_ms.load(Ordering::Relaxed) < total_ms
+    }
+
+    fn charge(&self, more: std::time::Duration) {
+        let more = more.as_millis() as u64;
+        if more > 0 {
+            self.spent_ms.fetch_add(more, Ordering::Relaxed);
+        }
+    }
+
+    fn reset_if_settled(&self, due: u64, settled: u64) {
+        if due <= settled {
+            self.spent_ms.store(0, Ordering::Relaxed);
+        }
+    }
+}
+
+static CATCHUP_GATE: CatchupGate = CatchupGate::new();
+
+fn texture_gate_ms() -> u64 {
     static TOTAL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    let total = *TOTAL.get_or_init(|| {
+    *TOTAL.get_or_init(|| {
         let seconds = std::env::var("VICTORY_TEXTURE_GATE_S")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
             .unwrap_or(60);
-        seconds * 1000
-    });
-    let more = more.as_millis() as u64;
-    SPENT.fetch_add(more, Ordering::Relaxed) + more < total
+        seconds.saturating_mul(1000)
+    })
 }
 
 /// Buffer views of the heap whose slot showed another host buffer than
@@ -1776,10 +1803,13 @@ impl State {
         const PER_FRAME_CATCHING_UP: u64 = 512 << 20;
         const SPAN_CATCHING_UP: std::time::Duration = std::time::Duration::from_millis(1500);
         const LONG: u64 = 2_000;
+        const SETTLED: u64 = 500;
         static CATCHUP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let catchup = *CATCHUP.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_CATCHUP").is_none_or(|v| v != "0"));
+        CATCHUP_GATE.reset_if_settled(census[0], SETTLED);
         let plain = span;
-        let (per_frame, span) = if catchup && census[0] > LONG && catching_up(std::time::Duration::ZERO) {
+        let catching = catchup && census[0] > LONG && CATCHUP_GATE.has_budget(texture_gate_ms());
+        let (per_frame, span) = if catching {
             (per_frame.max(PER_FRAME_CATCHING_UP), span.max(SPAN_CATCHING_UP))
         } else {
             (per_frame, span)
@@ -1955,7 +1985,9 @@ impl State {
                 host.texture_slot_recheck(index, frame, (at, len), crate::texture::fingerprint(at, len));
             }
         }
-        catching_up(began.elapsed().saturating_sub(plain));
+        if catching {
+            CATCHUP_GATE.charge(began.elapsed().saturating_sub(plain));
+        }
     }
 
     /// For the frame listing, after a dropped dispatch's line: its group
@@ -3508,5 +3540,39 @@ pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
     {
         // SAFETY: an open list on a device that supports depth bounds.
         unsafe { l1.OMSetDepthBounds(min, max) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CatchupGate;
+    use std::time::Duration;
+
+    #[test]
+    fn catchup_gate_resets_when_backlog_settles() {
+        let gate = CatchupGate::new();
+        assert!(gate.has_budget(60_000));
+
+        // Exhaust the loading backlog's 60 s allowance.
+        gate.charge(Duration::from_secs(35));
+        assert!(gate.has_budget(60_000));
+        gate.charge(Duration::from_secs(25));
+        assert!(!gate.has_budget(60_000));
+
+        // Still above settled threshold: stays exhausted.
+        gate.reset_if_settled(501, 500);
+        assert!(!gate.has_budget(60_000));
+
+        // Drained to <= 500 due slots between scenes: fresh budget for next scene.
+        gate.reset_if_settled(500, 500);
+        assert!(gate.has_budget(60_000));
+    }
+
+    #[test]
+    fn catchup_gate_zero_budget_stays_disabled() {
+        let gate = CatchupGate::new();
+        assert!(!gate.has_budget(0));
+        gate.reset_if_settled(0, 500);
+        assert!(!gate.has_budget(0));
     }
 }
