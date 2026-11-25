@@ -59,6 +59,29 @@ mod watch;
 
 #[cfg(windows)]
 pub use host::on_failure;
+
+/// Makes the host D3D12 device now, before the title runs, instead of on
+/// its first use (`VICTORY_HOST_EARLY=0`: on first use, as before).
+///
+/// `D3D12CreateDevice` reads the driver's shader disk cache. With a big one
+/// (16 GB for this title's family on an RTX 4080 after a day of runs) it
+/// took 26-31 s, mostly when the cache file was no longer in the system's
+/// file cache. Made on first use, that time falls inside the title's boot,
+/// whose watchdog thread ends the process after 30 s without a heartbeat
+/// (a deliberate write to address 0); made here, before the title's first
+/// thread, the boot is only later.
+pub fn make_host_early() {
+    if std::env::var_os("VICTORY_HOST_EARLY").is_some_and(|v| v == "0") {
+        return;
+    }
+    let started = std::time::Instant::now();
+    let made = host::host().is_some();
+    tracing::info!(
+        ms = started.elapsed().as_millis() as u64,
+        made,
+        "host device made before the title runs (VICTORY_HOST_EARLY=0: on its first use)"
+    );
+}
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
 #[cfg(windows)]
